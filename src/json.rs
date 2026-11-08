@@ -145,6 +145,11 @@ impl Serialize for ValRef<'_> {
     }
 }
 
+/// One value as JSON text, the way speasy's to_json writes it.
+pub fn value_json(store: &Store, val: &Val) -> String {
+    serde_json::to_string(&ValRef { store, val }).map(unquote_nonfinite).unwrap_or_default()
+}
+
 pub struct NodeRef<'a> {
     pub store: &'a Store,
     pub id: u32,

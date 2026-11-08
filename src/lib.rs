@@ -1,4 +1,5 @@
 //! Python bindings. Row ids are plain ints; node 0 is the root.
+mod capi;
 mod interner;
 mod json;
 mod search;
@@ -7,7 +8,8 @@ mod store;
 use json::{NodeRef, SPZ_KEYS};
 use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyCapsule, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use std::sync::Arc;
 use store::{Meta, NodeFields, OTHER, Store, Val, NONE};
 
 /// Python values into the store: exact types only, anything else is kept as the object itself (opaque).
@@ -164,22 +166,32 @@ impl<'py, 'a> Out<'py, 'a> {
 
 #[pyclass(name = "NativeStore", module = "inventory_store")]
 struct PyStore {
-    inner: Store,
+    shared: Arc<capi::Shared>,
     opaque: Vec<Py<PyAny>>,
-    search: Option<search::SearchIndex>,
 }
 
 impl PyStore {
+    fn of(store: Store) -> PyStore {
+        PyStore { shared: Arc::new(capi::Shared::new(store)), opaque: Vec::new() }
+    }
+
+    fn st(&self) -> &Store {
+        &self.shared.store
+    }
+
     fn check(&self, i: u32) -> PyResult<u32> {
-        if (i as usize) < self.inner.len() { Ok(i) } else { Err(PyIndexError::new_err(i)) }
+        if (i as usize) < self.st().len() { Ok(i) } else { Err(PyIndexError::new_err(i)) }
     }
 
     fn index(&self) -> PyResult<&search::SearchIndex> {
-        self.search.as_ref().ok_or_else(|| PyValueError::new_err("call build_search() first"))
+        self.shared.search.get().ok_or_else(|| PyValueError::new_err("call build_search() first"))
     }
 
-    fn ingest(&mut self) -> Ingest<'_> {
-        Ingest { store: &mut self.inner, opaque: &mut self.opaque }
+    /// Building needs the only reference: once handed to C through the capsule, the store is frozen.
+    fn ingest(&mut self) -> PyResult<Ingest<'_>> {
+        let shared = Arc::get_mut(&mut self.shared)
+            .ok_or_else(|| PyValueError::new_err("this store is shared through its C API, it can't change anymore"))?;
+        Ok(Ingest { store: &mut shared.store, opaque: &mut self.opaque })
     }
 }
 
@@ -187,21 +199,22 @@ impl PyStore {
 impl PyStore {
     #[new]
     fn new() -> Self {
-        PyStore { inner: Store::default(), opaque: Vec::new(), search: None }
+        PyStore::of(Store::default())
     }
 
     #[staticmethod]
     fn from_json(text: &str) -> PyResult<Self> {
         json::from_json(text)
-            .map(|inner| PyStore { inner, opaque: Vec::new(), search: None })
+            .map(PyStore::of)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     #[staticmethod]
     fn from_dict(root: &Bound<PyDict>) -> PyResult<Self> {
         let mut store = PyStore::new();
-        store.ingest().node(NONE, "", root)?;
-        store.inner.finish();
+        let mut ingest = store.ingest()?;
+        ingest.node(NONE, "", root)?;
+        ingest.store.finish();
         Ok(store)
     }
 
@@ -211,88 +224,89 @@ impl PyStore {
         &mut self, parent: Option<u32>, key: &str, name: &str, kind: &str, provider: &str, uid: &str,
         meta: Option<&Bound<PyDict>>,
     ) -> PyResult<u32> {
-        let id = self.inner.start_node(parent.unwrap_or(NONE), NodeFields { key, name, kind, provider, uid });
-        let mut ingest = self.ingest();
+        let mut ingest = self.ingest()?;
+        let id = ingest.store.start_node(parent.unwrap_or(NONE), NodeFields { key, name, kind, provider, uid });
         for (k, v) in meta.into_iter().flat_map(|m| m.iter()) {
             ingest.meta(&k.str()?.to_string(), &v)?;
         }
         Ok(id)
     }
 
-    fn finish(&mut self) {
-        self.inner.finish();
+    fn finish(&mut self) -> PyResult<()> {
+        self.ingest()?.store.finish();
+        Ok(())
     }
 
     fn __len__(&self) -> usize {
-        self.inner.len()
+        self.st().len()
     }
 
     fn key(&self, i: u32) -> PyResult<&str> {
-        Ok(self.inner.key(self.check(i)?))
+        Ok(self.st().key(self.check(i)?))
     }
     fn name(&self, i: u32) -> PyResult<&str> {
-        Ok(self.inner.name(self.check(i)?))
+        Ok(self.st().name(self.check(i)?))
     }
     fn kind(&self, i: u32) -> PyResult<&str> {
-        Ok(self.inner.kind(self.check(i)?))
+        Ok(self.st().kind(self.check(i)?))
     }
     fn provider(&self, i: u32) -> PyResult<&str> {
-        Ok(self.inner.provider(self.check(i)?))
+        Ok(self.st().provider(self.check(i)?))
     }
     fn uid(&self, i: u32) -> PyResult<&str> {
-        Ok(self.inner.uid(self.check(i)?))
+        Ok(self.st().uid(self.check(i)?))
     }
     fn parent_of(&self, i: u32) -> PyResult<Option<u32>> {
-        Ok(self.inner.parent(self.check(i)?))
+        Ok(self.st().parent(self.check(i)?))
     }
     fn children(&self, i: u32) -> PyResult<Vec<u32>> {
-        Ok(self.inner.children(self.check(i)?).to_vec())
+        Ok(self.st().children(self.check(i)?).to_vec())
     }
 
     fn meta<'py>(&self, py: Python<'py>, i: u32) -> PyResult<Bound<'py, PyDict>> {
-        let mut out = Out::new(py, &self.inner, &self.opaque, false);
+        let mut out = Out::new(py, self.st(), &self.opaque, false);
         let d = PyDict::new(py);
-        for (k, v) in self.inner.meta(self.check(i)?) {
+        for (k, v) in self.st().meta(self.check(i)?) {
             d.set_item(k, out.meta(v)?)?;
         }
         Ok(d)
     }
 
     fn get<'py>(&self, py: Python<'py>, i: u32, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let mut out = Out::new(py, &self.inner, &self.opaque, false);
-        self.inner.get(self.check(i)?, key).map(|m| out.meta(m)).transpose()
+        let mut out = Out::new(py, self.st(), &self.opaque, false);
+        self.st().get(self.check(i)?, key).map(|m| out.meta(m)).transpose()
     }
 
     fn find_uid(&self, provider: &str, uid: &str) -> Option<u32> {
-        self.inner.find_uid(provider, uid)
+        self.st().find_uid(provider, uid)
     }
 
     /// One attribute of a node, for the views: (True, child row) or (False, metadata value); None if absent.
     fn lookup<'py>(&self, py: Python<'py>, i: u32, key: &str) -> PyResult<Option<(bool, Bound<'py, PyAny>)>> {
         let i = self.check(i)?;
-        if let Some(c) = self.inner.find_child(i, key) {
+        if let Some(c) = self.st().find_child(i, key) {
             return Ok(Some((true, c.into_pyobject(py)?.into_any())));
         }
-        let mut out = Out::new(py, &self.inner, &self.opaque, false);
-        self.inner.get(i, key).map(|m| Ok((false, out.meta(m)?))).transpose()
+        let mut out = Out::new(py, self.st(), &self.opaque, false);
+        self.st().get(i, key).map(|m| Ok((false, out.meta(m)?))).transpose()
     }
 
     /// Children keys of a node, in order.
     fn child_keys(&self, i: u32) -> PyResult<Vec<&str>> {
-        Ok(self.inner.children(self.check(i)?).iter().map(|&c| self.inner.key(c)).collect())
+        Ok(self.st().children(self.check(i)?).iter().map(|&c| self.st().key(c)).collect())
     }
 
     fn find_path(&self, path: &str) -> Option<u32> {
-        self.inner.find_path(path)
+        self.st().find_path(path)
     }
 
     #[pyo3(signature = (provider=None, kind=None, contains=None))]
     fn filter(&self, provider: Option<&str>, kind: Option<&str>, contains: Option<(String, String)>) -> Vec<u32> {
-        self.inner.filter(provider, kind, contains.as_ref().map(|(k, t)| (k.as_str(), t.as_str())))
+        self.st().filter(provider, kind, contains.as_ref().map(|(k, t)| (k.as_str(), t.as_str())))
     }
 
     fn to_json(&self) -> PyResult<String> {
-        serde_json::to_string(&NodeRef { store: &self.inner, id: 0 })
+        serde_json::to_string(&NodeRef { store: self.st(), id: 0 })
             .map(json::unquote_nonfinite)
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
@@ -302,37 +316,34 @@ impl PyStore {
     fn to_legacy<'py>(&self, py: Python<'py>, types: &Bound<'py, PyDict>, default: &Bound<'py, PyAny>, row: u32)
         -> PyResult<Bound<'py, PyAny>> {
         let row = self.check(row)?;
-        Out::new(py, &self.inner, &self.opaque, true).legacy(row, types, default)
+        Out::new(py, self.st(), &self.opaque, true).legacy(row, types, default)
     }
 
     fn heap_bytes(&self) -> usize {
-        self.inner.heap_bytes()
+        self.st().heap_bytes()
     }
 
     /// Builds SciQLop's search corpus (one path and one meta text per leaf) and its BM25F index.
     #[pyo3(signature = (leaf_kinds=vec!["ParameterIndex".to_owned(), "TemplatedParameterIndex".to_owned()]))]
-    fn build_search(&mut self, py: Python, leaf_kinds: Vec<String>) -> usize {
+    fn build_search(&self, py: Python, leaf_kinds: Vec<String>) -> usize {
         let kinds: Vec<&str> = leaf_kinds.iter().map(String::as_str).collect();
-        let inner = &self.inner;
-        let index = py.detach(|| search::SearchIndex::build(inner, &kinds));
-        let n = index.leaves.len();
-        self.search = Some(index);
-        n
+        let shared = &self.shared;
+        py.detach(|| shared.search.get_or_init(|| search::SearchIndex::build(&shared.store, &kinds)).leaves.len())
     }
 
     fn search_heap_bytes(&self) -> usize {
-        self.search.as_ref().map_or(0, search::SearchIndex::heap_bytes)
+        self.shared.search.get().map_or(0, search::SearchIndex::heap_bytes)
     }
 
     /// (path text, meta text) of every leaf, by row: SciQLop's corpus_snapshot.
     fn corpus(&self) -> PyResult<Vec<(u32, String, String)>> {
-        let inner = &self.inner;
+        let inner = self.st();
         Ok(self.index()?.leaves.iter().map(|&r| { let (p, m) = search::leaf_texts(inner, r); (r, p, m) }).collect())
     }
 
     /// The flat filter model's pass: query syntax, filters, fuzzy score. [(row, score)] for non-zero scores.
     fn search(&self, py: Python, query: &str) -> PyResult<Vec<(u32, i32)>> {
-        let (index, inner) = (self.index()?, &self.inner);
+        let (index, inner) = (self.index()?, self.st());
         let q = search::parse(query);
         let hits = py.detach(|| index.fuzzy(inner, &q));
         Ok(hits.into_iter().map(|(i, s)| (index.leaves[i], s)).collect())
@@ -343,6 +354,18 @@ impl PyStore {
         let index = self.index()?;
         let hits = py.detach(|| index.bm25(text));
         Ok(hits.into_iter().map(|(i, s)| (index.leaves[i], s)).collect())
+    }
+
+    /// The C function table over this store, in a PyCapsule named "speasy.inventory_store.v1" (include/inventory_store.h).
+    /// The capsule holds one reference; a C consumer that keeps the store calls retain() on it.
+    fn __inventory_store_c_api__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
+        PyCapsule::new_with_value(py, capi::Capsule(capi::api(&self.shared)), capi::CAPSULE_NAME)
+    }
+
+    /// Identifies this snapshot: two stores never share it.
+    #[getter]
+    fn generation(&self) -> u64 {
+        self.shared.generation
     }
 }
 

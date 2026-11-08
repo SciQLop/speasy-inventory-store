@@ -279,6 +279,7 @@ pysciqlop_cache and SciQLopPlots.
 - `tests/test_equivalence.py`: each store against speasy's trees.
 - `tests/test_search.py`, `tests/parity_sciqlopplots.json`, `tests/bm25_reference.py`: the search against SciQLopPlots and SciQLop.
 - `bench/search_bench.py`: search timings (`RAYON_NUM_THREADS=1` for one core).
+- `QT_INTEGRATION.md`, `src/capi.rs`, `include/inventory_store.h`, `qt/`, `tests/test_capi.py`: sharing the store with C++/Qt through a PyCapsule, and a Qt model over it.
 - `bench/`: `bench.py` (one implementation per process), `clean_rss.py`, `run.py` (table).
 - Data, not committed:
   - `data/inventory_v2.json`: the proxy's version 2 `all` inventory plus the HAPI export;
