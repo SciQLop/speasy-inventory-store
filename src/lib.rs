@@ -7,55 +7,77 @@ use json::{NodeRef, SPZ_KEYS};
 use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use serde_json::{Map, Number, Value};
-use store::{Meta, NodeFields, OTHER, Store, NONE};
+use store::{Meta, NodeFields, OTHER, Store, Val, NONE};
 
-fn to_json(v: &Bound<PyAny>) -> PyResult<Value> {
-    Ok(if v.is_none() {
-        Value::Null
-    } else if let Ok(b) = v.cast::<PyBool>() {
-        Value::Bool(b.is_true())
-    } else if v.is_instance_of::<PyInt>() {
-        Value::Number(v.extract::<i64>()?.into())
-    } else if v.is_instance_of::<PyFloat>() {
-        Number::from_f64(v.extract::<f64>()?).map_or(Value::Null, Value::Number)
-    } else if let Ok(s) = v.cast::<PyString>() {
-        Value::String(s.to_str()?.to_owned())
-    } else if v.is_instance_of::<PyList>() || v.is_instance_of::<PyTuple>() {
-        Value::Array(v.try_iter()?.map(|x| to_json(&x?)).collect::<PyResult<_>>()?)
-    } else if let Ok(d) = v.cast::<PyDict>() {
-        let map: PyResult<Map<String, Value>> = d.iter().map(|(k, v)| Ok((k.str()?.to_string(), to_json(&v)?))).collect();
-        Value::Object(map?)
-    } else {
-        Value::String(v.str()?.to_string())
-    })
+/// Python values into the store: exact types only, anything else is kept as the object itself (opaque).
+struct Ingest<'a> {
+    store: &'a mut Store,
+    opaque: &'a mut Vec<Py<PyAny>>,
 }
 
-fn to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
-    Ok(match v {
-        Value::Null => py.None().into_bound(py),
-        Value::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
-        Value::Number(n) => match n.as_i64() {
-            Some(i) => i.into_pyobject(py)?.into_any(),
-            None => n.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any(),
-        },
-        Value::String(s) => PyString::new(py, s).into_any(),
-        Value::Array(a) => PyList::new(py, a.iter().map(|x| to_py(py, x)).collect::<PyResult<Vec<_>>>()?)?.into_any(),
-        Value::Object(o) => {
-            let d = PyDict::new(py);
-            for (k, v) in o {
-                d.set_item(k, to_py(py, v)?)?;
-            }
-            d.into_any()
-        }
-    })
-}
-
-fn meta_to_py<'py>(py: Python<'py>, m: Meta) -> PyResult<Bound<'py, PyAny>> {
-    match m {
-        Meta::Str(s) => Ok(PyString::new(py, s).into_any()),
-        Meta::Other(v) => to_py(py, v),
+impl Ingest<'_> {
+    fn val(&mut self, v: &Bound<PyAny>) -> PyResult<Val> {
+        Ok(if v.is_exact_instance_of::<PyString>() {
+            Val::Str(self.store.s.intern(v.cast::<PyString>()?.to_str()?))
+        } else if v.is_none() {
+            Val::Null
+        } else if v.is_exact_instance_of::<PyBool>() {
+            Val::Bool(v.is_truthy()?)
+        } else if v.is_exact_instance_of::<PyFloat>() {
+            Val::Float(v.extract()?)
+        } else if let Some(i) = v.is_exact_instance_of::<PyInt>().then(|| v.extract::<i64>().ok()).flatten() {
+            Val::Int(i)
+        } else if v.is_exact_instance_of::<PyList>() {
+            Val::List(self.items(v)?)
+        } else if v.is_exact_instance_of::<PyTuple>() {
+            Val::Tuple(self.items(v)?)
+        } else if let Some(d) = v.cast::<PyDict>().ok().filter(|d| is_plain_dict(d)) {
+            let entries: PyResult<Vec<_>> = d
+                .iter()
+                .map(|(k, x)| Ok((self.store.s.intern(k.cast::<PyString>()?.to_str()?), self.val(&x)?)))
+                .collect();
+            Val::Dict(entries?)
+        } else {
+            self.opaque.push(v.clone().unbind());
+            self.store.opaque(&v.str()?.to_string())
+        })
     }
+
+    fn items(&mut self, v: &Bound<PyAny>) -> PyResult<Vec<Val>> {
+        v.try_iter()?.map(|x| self.val(&x?)).collect()
+    }
+
+    fn meta(&mut self, key: &str, v: &Bound<PyAny>) -> PyResult<()> {
+        let value = self.val(v)?;
+        self.store.push_meta(key, value);
+        Ok(())
+    }
+
+    fn node(&mut self, parent: u32, key: &str, node: &Bound<PyDict>) -> PyResult<()> {
+        let [name, kind, provider, uid] =
+            ["__spz_name__", "__spz_type__", "__spz_provider__", "__spz_uid__"].map(|k| str_field(node, k));
+        let fields = NodeFields { key, name: &name?, kind: &kind?, provider: &provider?, uid: &uid? };
+        let id = self.store.start_node(parent, fields);
+        let mut children = Vec::new();
+        for (k, v) in node.iter() {
+            let k = k.str()?.to_string();
+            if SPZ_KEYS.contains(&k.as_str()) {
+                continue;
+            }
+            match v.cast::<PyDict>() {
+                Ok(d) if d.contains("__spz_type__")? => children.push((k, d.clone())),
+                _ => self.meta(&k, &v)?,
+            }
+        }
+        for (k, child) in children {
+            self.node(id, &k, &child)?;
+        }
+        Ok(())
+    }
+}
+
+fn is_plain_dict(d: &Bound<PyDict>) -> bool {
+    d.is_exact_instance_of::<PyDict>() && d.keys().iter().all(|k| k.is_exact_instance_of::<PyString>())
 }
 
 fn str_field(d: &Bound<PyDict>, key: &str) -> PyResult<String> {
@@ -65,51 +87,84 @@ fn str_field(d: &Bound<PyDict>, key: &str) -> PyResult<String> {
     })
 }
 
-fn push_meta(store: &mut Store, key: &str, v: &Bound<PyAny>) -> PyResult<()> {
-    match v.cast::<PyString>() {
-        Ok(s) => store.push_str(key, s.to_str()?),
-        Err(_) => store.push_other(key, to_json(v)?),
-    }
-    Ok(())
-}
-
-fn load_dict(store: &mut Store, parent: u32, key: &str, node: &Bound<PyDict>) -> PyResult<()> {
-    let [name, kind, provider, uid] =
-        ["__spz_name__", "__spz_type__", "__spz_provider__", "__spz_uid__"].map(|k| str_field(node, k));
-    let fields = NodeFields { key, name: &name?, kind: &kind?, provider: &provider?, uid: &uid? };
-    let id = store.start_node(parent, fields);
-    let mut children = Vec::new();
-    for (k, v) in node.iter() {
-        let k = k.str()?.to_string();
-        if SPZ_KEYS.contains(&k.as_str()) {
-            continue;
-        }
-        match v.cast::<PyDict>() {
-            Ok(d) if d.contains("__spz_type__")? => children.push((k, d.clone())),
-            _ => push_meta(store, &k, &v)?,
-        }
-    }
-    for (k, child) in children {
-        load_dict(store, id, &k, &child)?;
-    }
-    Ok(())
-}
-
-/// One Python string object per distinct string, so the legacy tree and its pickle share them too.
-struct PyStrings<'py> {
+/// Store values out to Python. With `cache`, one Python string object per distinct string, so the legacy tree and
+/// its pickle share them too.
+struct Out<'py, 'a> {
     py: Python<'py>,
-    cache: Vec<Option<Bound<'py, PyString>>>,
+    store: &'a Store,
+    opaque: &'a [Py<PyAny>],
+    strings: Vec<Option<Bound<'py, PyString>>>,
 }
 
-impl<'py> PyStrings<'py> {
-    fn get(&mut self, store: &Store, id: u32) -> Bound<'py, PyString> {
-        self.cache[id as usize].get_or_insert_with(|| PyString::new(self.py, store.s.str(id))).clone()
+impl<'py, 'a> Out<'py, 'a> {
+    fn new(py: Python<'py>, store: &'a Store, opaque: &'a [Py<PyAny>], cache: bool) -> Self {
+        Out { py, store, opaque, strings: if cache { vec![None; store.s.len()] } else { Vec::new() } }
+    }
+
+    fn s(&mut self, id: u32) -> Bound<'py, PyString> {
+        let (py, store) = (self.py, self.store);
+        match self.strings.get_mut(id as usize) {
+            Some(slot) => slot.get_or_insert_with(|| PyString::new(py, store.s.str(id))).clone(),
+            None => PyString::new(py, store.s.str(id)),
+        }
+    }
+
+    fn val(&mut self, v: &Val) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        Ok(match v {
+            Val::Str(id) => self.s(*id).into_any(),
+            Val::Int(i) => i.into_pyobject(py)?.into_any(),
+            Val::Float(f) => f.into_pyobject(py)?.into_any(),
+            Val::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
+            Val::Null => py.None().into_bound(py),
+            Val::List(items) => PyList::new(py, self.items(items)?)?.into_any(),
+            Val::Tuple(items) => PyTuple::new(py, self.items(items)?)?.into_any(),
+            Val::Dict(entries) => {
+                let d = PyDict::new(py);
+                for (k, x) in entries {
+                    d.set_item(self.s(*k), self.val(x)?)?;
+                }
+                d.into_any()
+            }
+            Val::Opaque(i) => self.opaque[*i as usize].bind(py).clone(),
+        })
+    }
+
+    fn items(&mut self, items: &[Val]) -> PyResult<Vec<Bound<'py, PyAny>>> {
+        items.iter().map(|x| self.val(x)).collect()
+    }
+
+    fn meta(&mut self, m: Meta) -> PyResult<Bound<'py, PyAny>> {
+        match m {
+            Meta::Str(s) => Ok(PyString::new(self.py, s).into_any()),
+            Meta::Other(v) => self.val(v),
+        }
+    }
+
+    fn legacy(&mut self, i: u32, types: &Bound<'py, PyDict>, default: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let st = self.store;
+        let [_, name, kind, provider, uid] = st.raw(i);
+        let cls = types.get_item(self.s(kind))?.unwrap_or_else(|| default.clone());
+        let obj = cls.call_method1("__new__", (&cls,))?;
+        let dict = obj.getattr("__dict__")?.cast_into::<PyDict>()?;
+        for (k, v) in st.raw_meta(i) {
+            let value = if v & OTHER != 0 { self.val(st.other(v))? } else { self.s(v).into_any() };
+            dict.set_item(self.s(k), value)?;
+        }
+        for &c in st.children(i) {
+            dict.set_item(self.s(st.raw(c)[0]), self.legacy(c, types, default)?)?;
+        }
+        for (k, v) in SPZ_KEYS.iter().zip([kind, name, provider, uid]) {
+            dict.set_item(PyString::intern(self.py, k), self.s(v))?;
+        }
+        Ok(obj)
     }
 }
 
 #[pyclass(name = "NativeStore", module = "inventory_store")]
 struct PyStore {
     inner: Store,
+    opaque: Vec<Py<PyAny>>,
 }
 
 impl PyStore {
@@ -117,25 +172,8 @@ impl PyStore {
         if (i as usize) < self.inner.len() { Ok(i) } else { Err(PyIndexError::new_err(i)) }
     }
 
-    fn legacy<'py>(
-        &self, i: u32, types: &Bound<'py, PyDict>, default: &Bound<'py, PyAny>, strings: &mut PyStrings<'py>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let st = &self.inner;
-        let [_, name, kind, provider, uid] = st.raw(i);
-        let cls = types.get_item(strings.get(st, kind))?.unwrap_or_else(|| default.clone());
-        let obj = cls.call_method1("__new__", (&cls,))?;
-        let dict = obj.getattr("__dict__")?.cast_into::<PyDict>()?;
-        for (k, v) in st.raw_meta(i) {
-            let value = if v & OTHER != 0 { to_py(strings.py, st.other(v))? } else { strings.get(st, v).into_any() };
-            dict.set_item(strings.get(st, k), value)?;
-        }
-        for &c in st.children(i) {
-            dict.set_item(strings.get(st, st.raw(c)[0]), self.legacy(c, types, default, strings)?)?;
-        }
-        for (k, v) in SPZ_KEYS.iter().zip([kind, name, provider, uid]) {
-            dict.set_item(PyString::intern(strings.py, k), strings.get(st, v))?;
-        }
-        Ok(obj)
+    fn ingest(&mut self) -> Ingest<'_> {
+        Ingest { store: &mut self.inner, opaque: &mut self.opaque }
     }
 }
 
@@ -143,20 +181,22 @@ impl PyStore {
 impl PyStore {
     #[new]
     fn new() -> Self {
-        PyStore { inner: Store::default() }
+        PyStore { inner: Store::default(), opaque: Vec::new() }
     }
 
     #[staticmethod]
     fn from_json(text: &str) -> PyResult<Self> {
-        json::from_json(text).map(|inner| PyStore { inner }).map_err(|e| PyValueError::new_err(e.to_string()))
+        json::from_json(text)
+            .map(|inner| PyStore { inner, opaque: Vec::new() })
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     #[staticmethod]
     fn from_dict(root: &Bound<PyDict>) -> PyResult<Self> {
-        let mut inner = Store::default();
-        load_dict(&mut inner, NONE, "", root)?;
-        inner.finish();
-        Ok(PyStore { inner })
+        let mut store = PyStore::new();
+        store.ingest().node(NONE, "", root)?;
+        store.inner.finish();
+        Ok(store)
     }
 
     /// Builder API: one call per node, parents before children; call finish() at the end.
@@ -166,8 +206,9 @@ impl PyStore {
         meta: Option<&Bound<PyDict>>,
     ) -> PyResult<u32> {
         let id = self.inner.start_node(parent.unwrap_or(NONE), NodeFields { key, name, kind, provider, uid });
+        let mut ingest = self.ingest();
         for (k, v) in meta.into_iter().flat_map(|m| m.iter()) {
-            push_meta(&mut self.inner, &k.str()?.to_string(), &v)?;
+            ingest.meta(&k.str()?.to_string(), &v)?;
         }
         Ok(id)
     }
@@ -203,15 +244,17 @@ impl PyStore {
     }
 
     fn meta<'py>(&self, py: Python<'py>, i: u32) -> PyResult<Bound<'py, PyDict>> {
+        let mut out = Out::new(py, &self.inner, &self.opaque, false);
         let d = PyDict::new(py);
         for (k, v) in self.inner.meta(self.check(i)?) {
-            d.set_item(k, meta_to_py(py, v)?)?;
+            d.set_item(k, out.meta(v)?)?;
         }
         Ok(d)
     }
 
     fn get<'py>(&self, py: Python<'py>, i: u32, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
-        self.inner.get(self.check(i)?, key).map(|m| meta_to_py(py, m)).transpose()
+        let mut out = Out::new(py, &self.inner, &self.opaque, false);
+        self.inner.get(self.check(i)?, key).map(|m| out.meta(m)).transpose()
     }
 
     fn find_uid(&self, provider: &str, uid: &str) -> Option<u32> {
@@ -228,14 +271,15 @@ impl PyStore {
     }
 
     fn to_json(&self) -> PyResult<String> {
-        serde_json::to_string(&NodeRef { store: &self.inner, id: 0 }).map_err(|e| PyValueError::new_err(e.to_string()))
+        serde_json::to_string(&NodeRef { store: &self.inner, id: 0 })
+            .map(json::unquote_nonfinite)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
     /// Rebuilds a tree of the old index classes ({type name: class}), for the legacy pickle.
     fn to_legacy<'py>(&self, py: Python<'py>, types: &Bound<'py, PyDict>, default: &Bound<'py, PyAny>)
         -> PyResult<Bound<'py, PyAny>> {
-        let mut strings = PyStrings { py, cache: vec![None; self.inner.s.len()] };
-        self.legacy(0, types, default, &mut strings)
+        Out::new(py, &self.inner, &self.opaque, true).legacy(0, types, default)
     }
 
     fn heap_bytes(&self) -> usize {

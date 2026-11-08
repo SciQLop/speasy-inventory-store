@@ -1,15 +1,29 @@
 //! The inventory as columns: one row per node, metadata as (key, value) runs, children as CSR.
 use crate::interner::Interner;
 use hashbrown::HashMap;
-use serde_json::Value;
 
 pub const NONE: u32 = u32::MAX;
-/// A metadata value with this bit set indexes `others` (non-string values, ~1% of them), else it's a string id.
+/// A metadata value with this bit set indexes `others`, else it is a string id: 87% of the values are strings.
 pub const OTHER: u32 = 1 << 31;
+
+/// Every type speasy's providers put in metadata, kept apart so each comes back as it went in.
+/// Strings anywhere, nested ones included, are interned ids.
+pub enum Val {
+    Str(u32),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Null,
+    List(Vec<Val>),
+    Tuple(Vec<Val>),
+    Dict(Vec<(u32, Val)>),
+    /// Anything else (numpy scalar, datetime, int beyond i64...): the binding keeps the object, the store its text.
+    Opaque(u32),
+}
 
 pub enum Meta<'a> {
     Str(&'a str),
-    Other(&'a Value),
+    Other(&'a Val),
 }
 
 #[derive(Default)]
@@ -24,7 +38,8 @@ pub struct Store {
     meta_start: Vec<u32>,
     meta_key: Vec<u32>,
     meta_val: Vec<u32>,
-    others: Vec<Value>,
+    others: Vec<Val>,
+    opaque_text: Vec<Box<str>>,
     child_start: Vec<u32>,
     child: Vec<u32>,
     by_uid: HashMap<(u32, u32), u32>,
@@ -54,17 +69,27 @@ impl Store {
         id
     }
 
-    pub fn push_str(&mut self, key: &str, value: &str) {
-        let (k, v) = (self.s.intern(key), self.s.intern(value));
+    pub fn push_meta(&mut self, key: &str, value: Val) {
+        let k = self.s.intern(key);
         self.meta_key.push(k);
+        let v = match value {
+            Val::Str(id) => id,
+            other => {
+                self.others.push(other);
+                OTHER | (self.others.len() - 1) as u32
+            }
+        };
         self.meta_val.push(v);
     }
 
-    pub fn push_other(&mut self, key: &str, value: Value) {
-        let k = self.s.intern(key);
-        self.meta_key.push(k);
-        self.meta_val.push(OTHER | self.others.len() as u32);
-        self.others.push(value);
+    /// Registers an opaque value by its text (for JSON export and C readers); returns its index.
+    pub fn opaque(&mut self, text: &str) -> Val {
+        self.opaque_text.push(text.into());
+        Val::Opaque((self.opaque_text.len() - 1) as u32)
+    }
+
+    pub fn opaque_text(&self, i: u32) -> &str {
+        &self.opaque_text[i as usize]
     }
 
     /// Builds the children index and the uid index, once every node is in.
@@ -117,20 +142,26 @@ impl Store {
         &self.child[self.child_start[i] as usize..self.child_start[i + 1] as usize]
     }
 
-    pub fn meta(&self, i: u32) -> impl Iterator<Item = (&str, Meta<'_>)> {
-        let i = i as usize;
-        let range = self.meta_start[i] as usize..self.meta_start[i + 1] as usize;
-        range.map(|m| (self.s.str(self.meta_key[m]), self.value(self.meta_val[m])))
+    fn meta_range(&self, i: u32) -> std::ops::Range<usize> {
+        self.meta_start[i as usize] as usize..self.meta_start[i as usize + 1] as usize
     }
 
     fn value(&self, v: u32) -> Meta<'_> {
         if v & OTHER != 0 { Meta::Other(&self.others[(v & !OTHER) as usize]) } else { Meta::Str(self.s.str(v)) }
     }
 
-    /// (key id, value) pairs, for callers that cache one object per string id.
+    pub fn meta(&self, i: u32) -> impl Iterator<Item = (&str, Meta<'_>)> {
+        self.meta_range(i).map(|m| (self.s.str(self.meta_key[m]), self.value(self.meta_val[m])))
+    }
+
+    /// (key id, value) pairs, for callers that cache one object per string id: a value with OTHER set goes to
+    /// `other`, else it is a string id.
     pub fn raw_meta(&self, i: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
-        let i = i as usize;
-        (self.meta_start[i] as usize..self.meta_start[i + 1] as usize).map(|m| (self.meta_key[m], self.meta_val[m]))
+        self.meta_range(i).map(|m| (self.meta_key[m], self.meta_val[m]))
+    }
+
+    pub fn other(&self, v: u32) -> &Val {
+        &self.others[(v & !OTHER) as usize]
     }
 
     /// key, name, kind, provider, uid string ids.
@@ -139,16 +170,9 @@ impl Store {
         [self.key[i], self.name[i], self.kind[i], self.provider[i], self.uid[i]]
     }
 
-    pub fn other(&self, v: u32) -> &Value {
-        &self.others[(v & !OTHER) as usize]
-    }
-
     pub fn get(&self, i: u32, key: &str) -> Option<Meta<'_>> {
         let k = self.s.get(key)?;
-        let i = i as usize;
-        (self.meta_start[i] as usize..self.meta_start[i + 1] as usize)
-            .find(|&m| self.meta_key[m] == k)
-            .map(|m| self.value(self.meta_val[m]))
+        self.meta_range(i).find(|&m| self.meta_key[m] == k).map(|m| self.value(self.meta_val[m]))
     }
 
     pub fn find_uid(&self, provider: &str, uid: &str) -> Option<u32> {
@@ -177,11 +201,24 @@ impl Store {
     }
 
     pub fn heap_bytes(&self) -> usize {
+        fn val_heap(v: &Val) -> usize {
+            match v {
+                Val::List(x) | Val::Tuple(x) => x.capacity() * size_of::<Val>() + x.iter().map(val_heap).sum::<usize>(),
+                Val::Dict(x) => {
+                    x.capacity() * size_of::<(u32, Val)>() + x.iter().map(|(_, v)| val_heap(v)).sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
         let u32s = [&self.key, &self.name, &self.kind, &self.provider, &self.uid, &self.parent, &self.meta_start,
             &self.meta_key, &self.meta_val, &self.child_start, &self.child]
             .iter()
             .map(|v| v.capacity() * 4)
             .sum::<usize>();
-        u32s + self.s.heap_bytes() + self.by_uid.capacity() * 13 + self.others.capacity() * size_of::<Value>()
+        u32s + self.s.heap_bytes()
+            + self.by_uid.capacity() * 13
+            + self.others.capacity() * size_of::<Val>()
+            + self.others.iter().map(val_heap).sum::<usize>()
+            + self.opaque_text.iter().map(|t| t.len() + 16).sum::<usize>()
     }
 }
