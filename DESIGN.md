@@ -130,7 +130,41 @@ Open design point: **lazily loaded subtrees.**
    which move to the builder API.
 4. **Native store behind the views.** `export_legacy_pickle(store)` stays outside the core and is deleted when old clients are gone.
 
-Not prototyped yet: the views of steps 2–3, and running speasy's test suite and SciQLop's speasy plugin against them.
+## Views experiment: speasy's suite on store-backed trees
+
+Branch `exp/store-views` in a speasy worktree (`~/Documents/prog/speasy-store-views`, local only).
+- With `SPEASY_STORE_VIEWS=1`, `update_inventory` copies each provider's finished tree into a `NativeStore`, and puts the
+  root's view in `spz.inventories.tree`.
+- Views (`speasy/core/inventory/store_views.py`):
+  - subclass the real index classes, with the same names;
+  - one view per row, created once and memoized;
+  - `__dict__` is a read-only mapping over the store;
+  - attribute access and `dir()` read the store;
+  - writes raise `TypeError`;
+  - pickling gives the real class (via `copyreg`), so the unpickling side needs neither the store nor this module.
+
+Results:
+- **speasy's full suite: 1941 passed with views, 1941 without.**
+- Before the fixes below, 28 tests failed with views, from two causes:
+  1. **Exact-type checks on index objects:** `impex/__init__.py` (`to_index`, `find_parent_dataset`) and
+     `hapi/inventory.py` (`_folder`). They now compare `spz_type()`. In the real migration, where the index classes
+     themselves become the views, these checks would keep working unchanged.
+  2. **A refresh that finds the inventory unchanged kept the old tree, and wrote the private AMDA part into it again.**
+     A frozen tree is now swapped instead, and code holding old nodes keeps a consistent snapshot.
+- **Smoke test** (navigation, `isinstance`, `vars`, `dir`, pickle, flat inventories, `get_data(view)`, a SciQLop-plugin-style
+  walk): everything works.
+  - The walk over CDA's 68k leaves takes 0.43 s, against 0.18 s with today's tree, because each attribute read goes through the store.
+- **A real session loading every provider's inventory:** 174 MB RSS with views, 257 MB without. Startup is 2.3 s instead of 1.5 s.
+  - The tree is still built in Python first (from the proxy's pickle) and copied into the store afterwards. The freed memory stays scattered, so
+    the gain is a third, not the 4× of a store loaded directly.
+  - Getting the rest means building the store straight from the proxy's version 2 JSON (`NativeStore.from_json`, 66 MB for everything
+    including HAPI), with providers writing through `add()`.
+
+Not covered:
+- **HAPI.** It has its own `update_inventory` and fills servers and datasets on first access, so it isn't frozen. This
+  needs the per-segment store.
+- **SciQLop's plugin**, which wasn't run itself (it needs the Qt stack). Its access patterns were replayed instead.
+- **The plugin's `_register_nodes` patch.** It wraps `ProviderInventory._register_nodes` and reads, but doesn't write.
 
 ## A. SciQLop's search, in the store (src/search.rs)
 
