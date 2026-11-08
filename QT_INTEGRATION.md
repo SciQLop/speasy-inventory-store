@@ -28,6 +28,13 @@ Status: research and prototype, 2026-11-08. Code: `src/inventory.rs`, `src/capi.
 6. **The performance holds:** the segmented inventory searches exactly like one store (same scores, same speed). The Qt
    walk covers all 115,574 nodes in 19 ms.
 
+## Agreed plan (2026-11-09)
+
+1. **The store becomes its own package,** in Rust, that speasy depends on. Its only C boundary is the database-like
+   interface; the handle-based one stays a prototype and is dropped.
+2. **SciQLopPlots:** lazy store-backed nodes in ProductsModel, with filter models and search querying the connection.
+3. **speasy's real migration:** providers load their inventory straight into the store.
+
 ## 0. What SciQLop costs today (`bench/sciqlop_today.py`)
 
 This replays SciQLop's startup path with Qt offscreen, using SciQLop's own environment: speasy 1.8.5, which has no HAPI
