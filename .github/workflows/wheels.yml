@@ -38,7 +38,8 @@ jobs:
       - name: Test the wheel
         shell: bash
         run: |
-          python -m pip install pytest speasy
+          # the fixture holds HAPI nodes, whose types no speasy release knows yet: use main until one does
+          python -m pip install pytest "speasy @ git+https://github.com/SciQLop/speasy@main"
           python -m pip install --no-index --find-links dist speasy-inventory-store
           python -m pytest -q tests
       - uses: actions/upload-artifact@v7
