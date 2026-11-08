@@ -82,7 +82,7 @@ impl Snapshot {
 
     /// Attached segments under the root, in order: (key, segment).
     pub fn top(&self) -> Vec<(String, u32)> {
-        self.top.iter().map(|s| (self.mounts[s].key.to_string(), *s)).collect()
+        self.top.iter().filter_map(|s| self.mounts.get(s).map(|m| (m.key.to_string(), *s))).collect()
     }
 
     pub fn child_count(&self, id: NodeId) -> u32 {
@@ -128,7 +128,7 @@ impl Snapshot {
 
     pub fn find_child(&self, id: NodeId, key: &str) -> Option<NodeId> {
         if id == ROOT {
-            return self.top.iter().find(|s| &*self.mounts[*s].key == key).map(|&s| node(s, 0));
+            return self.top.iter().find(|s| self.mounts.get(*s).is_some_and(|m| &*m.key == key)).map(|&s| node(s, 0));
         }
         let (m, row) = self.resolve(id)?;
         m.store().find_child(row, key).map(|c| node(m.seg, c))
@@ -243,14 +243,14 @@ pub enum MountError {
 
 impl Inventory {
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.current.lock().unwrap().clone()
+        self.current.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Attaches a provider's tree under the root as `key`, replacing the one there (removed, then inserted in place).
     pub fn attach(&self, key: &str, shared: Arc<Shared>) -> u32 {
         let seg = segment_of(&shared);
         self.change(|snap, log| {
-            let position = match snap.top.iter().position(|s| &*snap.mounts[s].key == key) {
+            let position = match snap.top.iter().position(|s| snap.mounts.get(s).is_some_and(|m| &*m.key == key)) {
                 Some(p) => {
                     let old = snap.top.remove(p);
                     snap.drop_segment(old);
@@ -274,7 +274,7 @@ impl Inventory {
     pub fn detach(&self, key: &str) -> bool {
         let mut found = false;
         self.change(|snap, log| {
-            if let Some(p) = snap.top.iter().position(|s| &*snap.mounts[s].key == key) {
+            if let Some(p) = snap.top.iter().position(|s| snap.mounts.get(s).is_some_and(|m| &*m.key == key)) {
                 let old = snap.top.remove(p);
                 snap.drop_segment(old);
                 log(snap, CHANGE_REMOVED, ROOT, p as u32, 1);
@@ -308,10 +308,20 @@ impl Inventory {
         result.map(|_| seg)
     }
 
+    /// The snapshot of version `seq`: the current one, or one still in the change log.
+    pub fn snapshot_at(&self, seq: u64) -> Option<Arc<Snapshot>> {
+        let current = self.snapshot();
+        if current.seq == seq {
+            return Some(current);
+        }
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        log.iter().find(|(c, _)| c.seq == seq).map(|(_, s)| s.clone())
+    }
+
     /// Changes after `after_seq`, each with the snapshot it leads to. Err when the log no longer reaches back there:
     /// the consumer resets from snapshot().
     pub fn changes_since(&self, after_seq: u64) -> Result<Vec<(Change, Arc<Snapshot>)>, ()> {
-        let log = self.log.lock().unwrap();
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
         match log.front() {
             Some((first, _)) if first.seq > after_seq + 1 => Err(()),
             _ => Ok(log.iter().filter(|(c, _)| c.seq > after_seq).cloned().collect()),
@@ -320,12 +330,12 @@ impl Inventory {
 
     pub fn subscribe(&self, notify: Notify, ctx: *mut c_void) -> u64 {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed) + 1;
-        self.subscribers.lock().unwrap().push((token, notify, ctx as usize));
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push((token, notify, ctx as usize));
         token
     }
 
     pub fn unsubscribe(&self, token: u64) {
-        self.subscribers.lock().unwrap().retain(|(t, _, _)| *t != token);
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner()).retain(|(t, _, _)| *t != token);
     }
 
     /// Writers are serialized by `current`'s lock. Each logged step publishes its own snapshot, so a consumer replays
@@ -333,7 +343,7 @@ impl Inventory {
     /// once the snapshot and log locks are released.
     fn change(&self, f: impl FnOnce(&mut Snapshot, &mut dyn FnMut(&mut Snapshot, u32, NodeId, u32, u32))) {
         {
-            let mut current = self.current.lock().unwrap();
+            let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
             let mut snap: Snapshot = (**current).clone();
             let mut steps: Vec<(Change, Arc<Snapshot>)> = Vec::new();
             f(&mut snap, &mut |s: &mut Snapshot, kind, host, position, count| {
@@ -343,8 +353,9 @@ impl Inventory {
             if steps.is_empty() {
                 return;
             }
-            *current = steps.last().unwrap().1.clone();
-            let mut log = self.log.lock().unwrap();
+            let Some((_, last)) = steps.last() else { return };
+            *current = last.clone();
+            let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
             log.extend(steps);
             while log.len() > LOG_SIZE {
                 log.pop_front();
@@ -352,7 +363,7 @@ impl Inventory {
         }
         // Notified under the lock: unsubscribe() then waits for a call in progress, so a consumer that unsubscribed
         // can be destroyed safely. Callbacks must only post an event (calling back into the inventory would deadlock).
-        let subscribers = self.subscribers.lock().unwrap();
+        let subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
         for (_, notify, ctx) in subscribers.iter() {
             notify(*ctx as *mut c_void);
         }

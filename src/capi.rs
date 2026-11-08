@@ -157,7 +157,7 @@ pub fn api(inv: &Arc<Inventory>) -> InventoryApi {
         meta_key,
         meta_value,
         meta_find,
-        meta_text,
+        meta_text: meta_text_entry,
         search,
         bm25,
     }
@@ -260,7 +260,7 @@ extern "C" fn meta_key(s: S, id: NodeId, i: u32) -> InvStr {
     entry(snap(s), id, i).map_or(InvStr::EMPTY, |(st, k, _)| InvStr::of(st.s.str(k)))
 }
 
-fn to_value(st: &Store, v: u32) -> InvValue {
+pub fn value_of(st: &Store, v: u32) -> InvValue {
     let mut out = InvValue { kind: INV_NULL, int_value: 0, float_value: 0.0, text: InvStr::EMPTY };
     if v & OTHER == 0 {
         out.kind = INV_STR;
@@ -287,7 +287,7 @@ extern "C" fn meta_value(s: S, id: NodeId, i: u32, out: *mut InvValue) {
     }
     let value = entry(snap(s), id, i).map_or(
         InvValue { kind: INV_NULL, int_value: 0, float_value: 0.0, text: InvStr::EMPTY },
-        |(st, _, v)| to_value(st, v),
+        |(st, _, v)| value_of(st, v),
     );
     unsafe { out.write(value) }
 }
@@ -298,19 +298,22 @@ extern "C" fn meta_find(s: S, id: NodeId, key: InvStr) -> u32 {
     st.raw_meta(row).position(|(kk, _)| kk == k).map_or(NONE, |i| i as u32)
 }
 
-/// Any value as text: strings as is, scalars printed, composites as JSON. The text lives during the call only.
-extern "C" fn meta_text(s: S, id: NodeId, i: u32, sink: TextSink, ctx: *mut c_void) {
+/// Any value as text: strings as is, scalars printed, composites as JSON.
+pub fn meta_text(st: &Store, v: u32) -> String {
+    if v & OTHER == 0 {
+        return st.s.str(v).to_owned();
+    }
+    match st.other(v) {
+        Val::Str(id) => st.s.str(*id).to_owned(),
+        Val::Opaque(i) => st.opaque_text(*i).to_owned(),
+        other => value_json(st, other),
+    }
+}
+
+/// The text lives during the call only.
+extern "C" fn meta_text_entry(s: S, id: NodeId, i: u32, sink: TextSink, ctx: *mut c_void) {
     let Some((st, _, v)) = entry(snap(s), id, i) else { return };
-    let text = if v & OTHER == 0 {
-        st.s.str(v).to_owned()
-    } else {
-        match st.other(v) {
-            Val::Str(id) => st.s.str(*id).to_owned(),
-            Val::Opaque(i) => st.opaque_text(*i).to_owned(),
-            other => value_json(st, other),
-        }
-    };
-    sink(ctx, InvStr::of(&text));
+    sink(ctx, InvStr::of(&meta_text(st, v)));
 }
 
 extern "C" fn search(s: S, query: InvStr, sink: HitSink, ctx: *mut c_void) -> u32 {

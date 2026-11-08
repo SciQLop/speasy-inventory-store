@@ -1,5 +1,6 @@
 //! Python bindings. Row ids are plain ints; node 0 is the root.
 mod capi;
+mod capi_db;
 mod interner;
 mod inventory;
 mod json;
@@ -465,6 +466,12 @@ impl PyInventory {
     /// (include/inventory_store.h). The capsule holds one reference; a C consumer that keeps it calls retain().
     fn __inventory_store_c_api__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
         PyCapsule::new_with_value(py, capi::Capsule(capi::api(&self.inner)), capi::CAPSULE_NAME)
+    }
+
+    /// The database-like C interface (include/inventory_db.h), in a PyCapsule named "speasy.inventory_db.v1":
+    /// call its connect() while holding the capsule; after that, C holds only integers.
+    fn __inventory_db_c_api__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
+        PyCapsule::new_with_value(py, capi_db::DbCapsule(capi_db::api(&self.inner)), capi_db::DB_CAPSULE_NAME)
     }
 }
 

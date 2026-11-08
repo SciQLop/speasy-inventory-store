@@ -23,7 +23,9 @@ Status: research and prototype, 2026-11-08. Code: `src/inventory.rs`, `src/capi.
    - CDA is refreshed;
    - no tester failure throughout, pinned indexes outside the changed parts stay valid, and search finds the new
      products.
-5. **The performance holds:** the segmented inventory searches exactly like one store (same scores, same speed). The Qt
+5. **A database-like C interface is the better boundary** (section 3b). C++ holds only a connection number and version
+   numbers, results are copied out, and hostile input gets a status instead of a crash. The cost doesn't show in a view.
+6. **The performance holds:** the segmented inventory searches exactly like one store (same scores, same speed). The Qt
    walk covers all 115,574 nodes in 19 ms.
 
 ## 0. What SciQLop costs today (`bench/sciqlop_today.py`)
@@ -189,6 +191,43 @@ all. Two ways to keep expansion across a refresh:
 build's garbage (every leaf's term strings, postings grown by doubling) stayed scattered after being freed. It now
 keeps terms as 64-bit hashes and builds one exactly-sized flat postings array in bounded chunks. It holds 52 MB, adds
 about 72–80 MB, and builds in 0.28 s on 16 threads, against 0.5 s before. The store itself is unchanged at 66 MB.
+
+## 3b. A database-like C interface instead (`src/capi_db.rs`, `include/inventory_db.h`, `qt/DbModel.*`)
+
+**The question:** could SciQLop talk to the inventory like a database, so C++ holds no object of it?
+
+**The prototype:**
+- **One connection per consumer, as an integer in a registry on the Rust side.** Node ids and versions are integers too.
+- **A connection pins the versions it reads.** Snapshots stay alive in the registry, not in the caller.
+- **Every result is copied:** into the caller's buffer, or through a callback whose strings are valid during the call.
+- **Every entry point checks its arguments, catches panics** (they become `INV_INTERNAL` instead of aborting SciQLop), and
+  returns a status.
+- **Display names and tooltips are computed on the store's side,** one call each.
+
+It runs side by side with the handle-based interface, on the same data.
+
+| | handles (StoreModel) | database (DbModel) |
+|---|---|---|
+| what C++ holds | inventory and snapshot pointers to retain/release; borrowed strings tied to a snapshot | one connection number, one pinned version number |
+| a wrong or stale id, use after release/disconnect, invalid UTF-8, null pointer or callback | undefined behaviour (likely a crash) | a status code: tested on every entry point with random ids, unpinned versions, invalid UTF-8, null out-pointers and callbacks, too-small buffers, use after disconnect (`tests/test_capi_db.py`) |
+| a panic in the store | aborts SciQLop | `INV_INTERNAL`, the call does nothing |
+| Qt walk, 115,574 nodes | 13 ms | 34 ms |
+| search through the model | 125 ms | 126 ms |
+| 1,000 tooltips | 2.1 ms | 1.5 ms (one call each) |
+| live lazy session (`bench/lazy_session.py db`) | passes the model tester | passes the model tester, identical signals, 0 errors |
+| C ABI on the Rust side | 277 lines, 14 `unsafe` | 333 lines, 7 `unsafe` |
+| the Qt model | 191 lines | 178 lines |
+
+**The cost** is about 45 ns per call: a registry lock, a lookup and a reference count. A full walk of everything is 2.6× slower,
+but a view only asks for its visible rows (tens at a time), so that's microseconds per screen. If it ever matters, a
+per-thread cache of the pinned snapshot removes it.
+
+**Verdict: worth it.**
+- **It turns every misuse from the C++ side into an error code,** and keeps a bug in the store from taking SciQLop down.
+- **Its cost isn't visible to a user.**
+- **The code on both sides is no larger.**
+- **There's nothing left to wrap** in a C++ RAII layer: there's one connection to close.
+- **It's request/response,** so it would also work across a process boundary (speasy in a Jupyter kernel) if that's ever wanted.
 
 ## 4. Fitting it into SciQLopPlots' ProductsModel
 

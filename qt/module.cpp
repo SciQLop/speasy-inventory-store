@@ -50,6 +50,22 @@ void ensure_app()
         new QCoreApplication(argc, nullptr);
     qInstallMessageHandler(count_warnings);
 }
+} // namespace
+
+int store_qt_warnings() { return g_warnings; }
+void store_qt_reset_warnings() { g_warnings = 0; }
+void store_qt_ensure_app() { ensure_app(); }
+
+PyObject* db_attach(PyObject*, PyObject*);
+PyObject* db_process_events(PyObject*, PyObject*);
+PyObject* db_walk(PyObject*, PyObject*);
+PyObject* db_search(PyObject*, PyObject*);
+PyObject* db_pin(PyObject*, PyObject*);
+PyObject* db_pinned(PyObject*, PyObject*);
+PyObject* db_detach(PyObject*, PyObject*);
+
+namespace
+{
 
 bool take_api(PyObject* inventory, InventoryApi& out)
 {
@@ -216,6 +232,13 @@ PyMethodDef methods[] = {
     { "pinned", pinned, METH_VARARGS, "pinned(i) -> (valid, display, rows)" },
     { "control_warnings", control_warnings, METH_NOARGS, "tester warnings on a stock QStringListModel" },
     { "detach", detach, METH_NOARGS, "drops the model" },
+    { "db_attach", db_attach, METH_VARARGS, "db_attach(inventory): a DbModel (database-like C API), watched by the tester" },
+    { "db_process_events", db_process_events, METH_NOARGS, "" },
+    { "db_walk", db_walk, METH_NOARGS, "" },
+    { "db_search", db_search, METH_VARARGS, "" },
+    { "db_pin", db_pin, METH_VARARGS, "" },
+    { "db_pinned", db_pinned, METH_VARARGS, "" },
+    { "db_detach", db_detach, METH_NOARGS, "" },
     { nullptr, nullptr, 0, nullptr },
 };
 
