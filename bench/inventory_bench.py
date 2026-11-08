@@ -13,7 +13,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "qt", "build"))
 from bench import rss_mb  # noqa: E402
 
-from inventory_store import Inventory, NativeStore  # noqa: E402
+from speasy_inventory_store import Inventory, NativeStore  # noqa: E402
 
 FUZZY = ["mag", "mms1 fgm bgse", "provider:cda density", "provider:cda after:2020 b_gse", "magnetic field vector"]
 BM25 = ["mms fgm b gse", "solar wind proton density", "electron pitch angle distribution"]

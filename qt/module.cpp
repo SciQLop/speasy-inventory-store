@@ -1,10 +1,10 @@
 // A Python extension holding the Qt side, loaded in the same interpreter as speasy, like SciQLopPlots in SciQLop.
-// It keeps one StoreModel watched by QAbstractItemModelTester (which checks every insert/remove signal against the
+// It keeps one DbModel (over the database-like C interface, inventory_db.h) watched by QAbstractItemModelTester (which checks every insert/remove signal against the
 // model's state), while Python makes the inventory grow: providers starting, lazy nodes filling in, refreshes.
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include "StoreModel.hpp"
+#include "DbModel.hpp"
 
 #include <QAbstractItemModelTester>
 #include <QCoreApplication>
@@ -24,25 +24,6 @@ void count_warnings(QtMsgType type, const QMessageLogContext&, const QString& me
         fprintf(stderr, "qt: %s\n", qPrintable(message));
 }
 
-struct Counters
-{
-    long inserted = 0, removed = 0, resets = 0, data_changed = 0;
-};
-
-struct State
-{
-    std::unique_ptr<StoreModel> model;
-    std::unique_ptr<QAbstractItemModelTester> tester;
-    std::vector<QPersistentModelIndex> pins;
-    Counters counters;
-};
-
-State& state()
-{
-    static State s;
-    return s;
-}
-
 void ensure_app()
 {
     static int argc = 0;
@@ -50,69 +31,23 @@ void ensure_app()
         new QCoreApplication(argc, nullptr);
     qInstallMessageHandler(count_warnings);
 }
-} // namespace
-
-int store_qt_warnings() { return g_warnings; }
-void store_qt_reset_warnings() { g_warnings = 0; }
-void store_qt_ensure_app() { ensure_app(); }
-
-PyObject* db_attach(PyObject*, PyObject*);
-PyObject* db_process_events(PyObject*, PyObject*);
-PyObject* db_walk(PyObject*, PyObject*);
-PyObject* db_search(PyObject*, PyObject*);
-PyObject* db_pin(PyObject*, PyObject*);
-PyObject* db_pinned(PyObject*, PyObject*);
-PyObject* db_detach(PyObject*, PyObject*);
-
-namespace
+struct Counters
 {
+    long inserted = 0, removed = 0, resets = 0, data_changed = 0;
+};
 
-bool take_api(PyObject* inventory, InventoryApi& out)
+struct DbState
 {
-    PyObject* capsule = PyObject_CallMethod(inventory, "__inventory_store_c_api__", nullptr);
-    if (!capsule)
-        return false;
-    auto* api = static_cast<const InventoryApi*>(PyCapsule_GetPointer(capsule, INVENTORY_STORE_CAPSULE_NAME));
-    const bool ok = api && api->abi_version == INVENTORY_STORE_ABI_VERSION && api->struct_size >= sizeof(InventoryApi);
-    if (ok)
-        out = *api; // StoreModel retains it
-    else if (!PyErr_Occurred())
-        PyErr_SetString(PyExc_TypeError, "incompatible inventory C API");
-    Py_DECREF(capsule);
-    return ok;
-}
+    std::unique_ptr<DbModel> model;
+    std::unique_ptr<QAbstractItemModelTester> tester;
+    std::vector<QPersistentModelIndex> pins;
+    Counters counters;
+};
 
-PyObject* attach(PyObject*, PyObject* args)
+DbState& db()
 {
-    PyObject* inventory;
-    if (!PyArg_ParseTuple(args, "O", &inventory))
-        return nullptr;
-    InventoryApi api;
-    if (!take_api(inventory, api))
-        return nullptr;
-    ensure_app();
-    auto& s = state();
-    s.tester.reset();
-    s.pins.clear();
-    s.model = std::make_unique<StoreModel>(api);
-    s.counters = {};
-    auto* m = s.model.get();
-    QObject::connect(m, &QAbstractItemModel::rowsInserted, [&s] { ++s.counters.inserted; });
-    QObject::connect(m, &QAbstractItemModel::rowsRemoved, [&s] { ++s.counters.removed; });
-    QObject::connect(m, &QAbstractItemModel::modelReset, [&s] { ++s.counters.resets; });
-    QObject::connect(m, &QAbstractItemModel::dataChanged, [&s] { ++s.counters.data_changed; });
-    g_warnings = 0;
-    s.tester = std::make_unique<QAbstractItemModelTester>(m, QAbstractItemModelTester::FailureReportingMode::Warning);
-    Py_RETURN_NONE;
-}
-
-PyObject* process_events(PyObject*, PyObject*)
-{
-    Py_BEGIN_ALLOW_THREADS QCoreApplication::processEvents();
-    Py_END_ALLOW_THREADS auto& s = state();
-    return Py_BuildValue("{s:l,s:l,s:l,s:l,s:i,s:i}", "inserted", s.counters.inserted, "removed", s.counters.removed,
-                         "resets", s.counters.resets, "data_changed", s.counters.data_changed, "warnings",
-                         g_warnings, "top_rows", s.model ? s.model->rowCount() : -1);
+    static DbState s;
+    return s;
 }
 
 struct Walk
@@ -120,7 +55,7 @@ struct Walk
     long nodes = 0, bad_parents = 0;
 };
 
-void walk(const StoreModel& model, const QModelIndex& parent, Walk& w)
+void walk(const DbModel& model, const QModelIndex& parent, Walk& w)
 {
     const int n = model.rowCount(parent);
     for (int r = 0; r < n; ++r)
@@ -133,9 +68,53 @@ void walk(const StoreModel& model, const QModelIndex& parent, Walk& w)
     }
 }
 
-PyObject* walk_model(PyObject*, PyObject*)
+
+PyObject* attach(PyObject*, PyObject* args)
 {
-    auto& s = state();
+    PyObject* inventory;
+    if (!PyArg_ParseTuple(args, "O", &inventory))
+        return nullptr;
+    PyObject* capsule = PyObject_CallMethod(inventory, "__inventory_db_c_api__", nullptr);
+    if (!capsule)
+        return nullptr;
+    auto* api = static_cast<const InventoryDbApi*>(PyCapsule_GetPointer(capsule, INVENTORY_DB_CAPSULE_NAME));
+    if (!api || api->abi_version != INVENTORY_DB_ABI_VERSION || api->struct_size < sizeof(InventoryDbApi))
+    {
+        Py_DECREF(capsule);
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_TypeError, "incompatible inventory db C API");
+        return nullptr;
+    }
+    ensure_app();
+    auto& s = db();
+    s.tester.reset();
+    s.pins.clear();
+    s.model = std::make_unique<DbModel>(api); // connects while the capsule is alive
+    Py_DECREF(capsule);
+    s.counters = {};
+    auto* m = s.model.get();
+    QObject::connect(m, &QAbstractItemModel::rowsInserted, [&s] { ++s.counters.inserted; });
+    QObject::connect(m, &QAbstractItemModel::rowsRemoved, [&s] { ++s.counters.removed; });
+    QObject::connect(m, &QAbstractItemModel::modelReset, [&s] { ++s.counters.resets; });
+    QObject::connect(m, &QAbstractItemModel::dataChanged, [&s] { ++s.counters.data_changed; });
+    g_warnings = 0;
+    s.tester = std::make_unique<QAbstractItemModelTester>(m, QAbstractItemModelTester::FailureReportingMode::Warning);
+    return PyBool_FromLong(m->connected());
+}
+
+PyObject* process_events(PyObject*, PyObject*)
+{
+    Py_BEGIN_ALLOW_THREADS QCoreApplication::processEvents();
+    Py_END_ALLOW_THREADS auto& s = db();
+    return Py_BuildValue("{s:l,s:l,s:l,s:l,s:i,s:i,s:l}", "inserted", s.counters.inserted, "removed",
+                         s.counters.removed, "resets", s.counters.resets, "data_changed", s.counters.data_changed,
+                         "warnings", g_warnings, "top_rows", s.model ? s.model->rowCount() : -1, "errors",
+                         s.model ? s.model->errors() : -1);
+}
+
+PyObject* walk(PyObject*, PyObject*)
+{
+    auto& s = db();
     Walk w;
     double ms;
     Py_BEGIN_ALLOW_THREADS QElapsedTimer t;
@@ -151,7 +130,7 @@ PyObject* search(PyObject*, PyObject* args)
     const char* query;
     if (!PyArg_ParseTuple(args, "s", &query))
         return nullptr;
-    auto& s = state();
+    auto& s = db();
     long hits, ok;
     double ms, tooltips_ms;
     Py_BEGIN_ALLOW_THREADS QElapsedTimer t;
@@ -168,13 +147,12 @@ PyObject* search(PyObject*, PyObject* args)
                                               "tooltips_1000_ms", tooltips_ms);
 }
 
-//! Pins the index at a key path, like a selection or an expanded node in a view. Returns the pin number, or -1.
 PyObject* pin(PyObject*, PyObject* args)
 {
     PyObject* keys;
     if (!PyArg_ParseTuple(args, "O", &keys))
         return nullptr;
-    auto& s = state();
+    auto& s = db();
     QModelIndex at;
     const Py_ssize_t n = PySequence_Length(keys);
     for (Py_ssize_t k = 0; k < n; ++k)
@@ -184,7 +162,7 @@ PyObject* pin(PyObject*, PyObject* args)
         Py_DECREF(item);
         QModelIndex next;
         for (int r = 0; r < s.model->rowCount(at) && !next.isValid(); ++r)
-            if (s.model->index(r, 0, at).data(StoreModel::KeyRole).toString() == key)
+            if (s.model->index(r, 0, at).data(DbModel::KeyRole).toString() == key)
                 next = s.model->index(r, 0, at);
         if (!next.isValid())
             return PyLong_FromLong(-1);
@@ -194,15 +172,23 @@ PyObject* pin(PyObject*, PyObject* args)
     return PyLong_FromSsize_t(Py_ssize_t(s.pins.size()) - 1);
 }
 
-//! (valid, display name, row count) of a pinned index.
 PyObject* pinned(PyObject*, PyObject* args)
 {
     int i;
     if (!PyArg_ParseTuple(args, "i", &i))
         return nullptr;
-    const QPersistentModelIndex& p = state().pins.at(i);
+    const QPersistentModelIndex& p = db().pins.at(i);
     return Py_BuildValue("(Nsi)", PyBool_FromLong(p.isValid()), qPrintable(p.data().toString()),
-                         p.isValid() ? state().model->rowCount(p) : -1);
+                         p.isValid() ? db().model->rowCount(p) : -1);
+}
+
+PyObject* detach(PyObject*, PyObject*)
+{
+    auto& s = db();
+    s.pins.clear();
+    s.tester.reset();
+    s.model.reset();
+    Py_RETURN_NONE;
 }
 
 PyObject* control_warnings(PyObject*, PyObject*)
@@ -214,31 +200,15 @@ PyObject* control_warnings(PyObject*, PyObject*)
     return PyLong_FromLong(g_warnings);
 }
 
-PyObject* detach(PyObject*, PyObject*)
-{
-    auto& s = state();
-    s.pins.clear();
-    s.tester.reset();
-    s.model.reset();
-    Py_RETURN_NONE;
-}
-
 PyMethodDef methods[] = {
-    { "attach", attach, METH_VARARGS, "attach(inventory): a StoreModel over it, watched by QAbstractItemModelTester" },
+    { "attach", attach, METH_VARARGS, "attach(inventory): a DbModel over it, watched by QAbstractItemModelTester" },
     { "process_events", process_events, METH_NOARGS, "runs queued events (model syncs); returns signal counters" },
-    { "walk", walk_model, METH_NOARGS, "walks every index" },
+    { "walk", walk, METH_NOARGS, "walks every index" },
     { "search", search, METH_VARARGS, "search(query) through the model" },
     { "pin", pin, METH_VARARGS, "pin(keys): a persistent index at a key path" },
     { "pinned", pinned, METH_VARARGS, "pinned(i) -> (valid, display, rows)" },
-    { "control_warnings", control_warnings, METH_NOARGS, "tester warnings on a stock QStringListModel" },
     { "detach", detach, METH_NOARGS, "drops the model" },
-    { "db_attach", db_attach, METH_VARARGS, "db_attach(inventory): a DbModel (database-like C API), watched by the tester" },
-    { "db_process_events", db_process_events, METH_NOARGS, "" },
-    { "db_walk", db_walk, METH_NOARGS, "" },
-    { "db_search", db_search, METH_VARARGS, "" },
-    { "db_pin", db_pin, METH_VARARGS, "" },
-    { "db_pinned", db_pinned, METH_VARARGS, "" },
-    { "db_detach", db_detach, METH_NOARGS, "" },
+    { "control_warnings", control_warnings, METH_NOARGS, "tester warnings on a stock QStringListModel" },
     { nullptr, nullptr, 0, nullptr },
 };
 

@@ -1,5 +1,4 @@
 //! Python bindings. Row ids are plain ints; node 0 is the root.
-mod capi;
 mod capi_db;
 mod interner;
 mod inventory;
@@ -168,13 +167,13 @@ impl<'py, 'a> Out<'py, 'a> {
 
 #[pyclass(name = "NativeStore", module = "inventory_store")]
 struct PyStore {
-    shared: Arc<capi::Shared>,
+    shared: Arc<inventory::Shared>,
     opaque: Vec<Py<PyAny>>,
 }
 
 impl PyStore {
     fn of(store: Store) -> PyStore {
-        PyStore { shared: Arc::new(capi::Shared::new(store)), opaque: Vec::new() }
+        PyStore { shared: Arc::new(inventory::Shared::new(store)), opaque: Vec::new() }
     }
 
     fn st(&self) -> &Store {
@@ -462,13 +461,7 @@ impl PyInventory {
         py.detach(|| snap.bm25(text))
     }
 
-    /// The C function table over this inventory, in a PyCapsule named "speasy.inventory_store.v2"
-    /// (include/inventory_store.h). The capsule holds one reference; a C consumer that keeps it calls retain().
-    fn __inventory_store_c_api__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
-        PyCapsule::new_with_value(py, capi::Capsule(capi::api(&self.inner)), capi::CAPSULE_NAME)
-    }
-
-    /// The database-like C interface (include/inventory_db.h), in a PyCapsule named "speasy.inventory_db.v1":
+    /// The database-like C interface (inventory_db.h), in a PyCapsule named "speasy.inventory_db.v1":
     /// call its connect() while holding the capsule; after that, C holds only integers.
     fn __inventory_db_c_api__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
         PyCapsule::new_with_value(py, capi_db::DbCapsule(capi_db::api(&self.inner)), capi_db::DB_CAPSULE_NAME)

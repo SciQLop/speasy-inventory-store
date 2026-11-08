@@ -2,7 +2,7 @@
 import json, os, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
 import bm25_reference
-from inventory_store import NativeStore
+from speasy_inventory_store import NativeStore
 
 FUZZY = ["mag", "mms1 fgm bgse", "provider:cda density", "provider:cda after:2020 b_gse", "magnetic field vector"]
 BM25 = ["mms fgm b gse", "solar wind proton density", "electron pitch angle distribution"]

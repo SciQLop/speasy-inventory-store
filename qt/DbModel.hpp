@@ -1,4 +1,4 @@
-// The same Qt model as StoreModel, over the database-like interface (include/inventory_db.h): it holds a
+// A Qt model over the database-like interface (inventory_db.h): it holds a
 // connection number and a pinned version, nothing that points into the inventory.
 #pragma once
 #include "inventory_db.h"

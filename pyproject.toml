@@ -3,11 +3,18 @@ requires = ["maturin>=1.16,<2"]
 build-backend = "maturin"
 
 [project]
-name = "inventory-store"
+name = "speasy-inventory-store"
 version = "0.1.0"
-description = "Prototype: a columnar store for speasy's inventory, benchmarked against the Python tree"
+description = "A native store for speasy's inventory: compact, searchable, readable from C/C++ without the GIL"
 requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Alexis Jeandet", email = "alexis.jeandet@member.fsf.org" }]
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
+
+[project.urls]
+Repository = "https://github.com/SciQLop/speasy-inventory-store"
 
 [tool.maturin]
 python-source = "python"
-module-name = "inventory_store._native"
+module-name = "speasy_inventory_store._native"

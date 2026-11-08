@@ -2,7 +2,7 @@
 providers start on first use, a HAPI server and dataset load on first access, a provider is refreshed. At each step:
 the model's rows, QAbstractItemModelTester's verdict (it checks every insert/remove signal), pinned indexes, search.
 
-usage: SPEASY_STORE_VIEWS=1 python lazy_session.py [db]   (db: the database-like C interface's model)
+usage: SPEASY_STORE_VIEWS=1 python lazy_session.py
 """
 import os
 import sys
@@ -14,11 +14,7 @@ os.environ["SPEASY_STORE_VIEWS"] = "1"
 import store_qt  # noqa: E402
 import speasy as spz  # noqa: E402
 
-DB = "db" in sys.argv[1:]
-attach, process_events, walk, search, pin, pinned = (
-    (store_qt.db_attach, store_qt.db_process_events, store_qt.db_walk, store_qt.db_search, store_qt.db_pin,
-     store_qt.db_pinned) if DB else
-    (store_qt.attach, store_qt.process_events, store_qt.walk, store_qt.search, store_qt.pin, store_qt.pinned))
+from store_qt import attach, process_events, walk, search, pin, pinned  # noqa: E402
 from speasy.core.inventory.store_views import INVENTORY  # noqa: E402
 
 

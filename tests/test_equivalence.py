@@ -11,17 +11,16 @@ import numpy as np
 import pytest
 from speasy.core.inventory.indexes import SpeasyIndex, __INDEXES_TYPES__, from_dict
 
-from inventory_store import BlobStore, NativeStore, PyStore
+import fixtures
+from speasy_inventory_store import NativeStore
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data", "inventory_v2.json")
 LIVE = os.path.join(os.path.dirname(__file__), "..", "data", "live_trees.pkl")
-STORES = [PyStore, BlobStore, NativeStore]
+STORES = [NativeStore]
 
 
 @pytest.fixture(scope="module")
 def inventory() -> dict:
-    with open(DATA) as f:
-        return json.load(f)
+    return fixtures.inventory()
 
 
 @pytest.fixture(scope="module", params=STORES, ids=lambda s: s.__name__)

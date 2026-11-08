@@ -1,17 +1,17 @@
-"""The database-like C interface as a C consumer sees it (include/inventory_db.h, mirrored with ctypes). Besides normal
+"""The database-like C interface as a C consumer sees it (inventory_db.h, mirrored with ctypes). Besides normal
 use, hostile input at every entry point: wrong connections, unpinned versions, random node ids, invalid UTF-8, null
 out-pointers and callbacks, small buffers. Every call must return a status; none may crash the process."""
 import ctypes as C
-import json
 import os
 import random
 
 import pytest
 
-from inventory_store import Inventory, NativeStore
+import fixtures
+import speasy_inventory_store
+from speasy_inventory_store import Inventory, NativeStore
 from test_inventory import loaded_server, server_segment
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data", "inventory_v2.json")
 OK, NOT_FOUND, BAD_CONNECTION, BAD_VERSION, BAD_ARGUMENT, BUFFER_TOO_SMALL, RESET_NEEDED, INTERNAL = range(8)
 ROOT, NO_NODE, CURRENT = 0, 2 ** 64 - 1, 2 ** 64 - 1
 DISPLAY, TOOLTIP = 5, 6
@@ -88,10 +88,9 @@ def b(s):
 @pytest.fixture(scope="module")
 def big():
     inv = Inventory()
-    with open(DATA) as f:
-        for key, tree in json.load(f).items():
-            if type(tree) is dict and "__spz_type__" in tree:
-                inv.attach(key, NativeStore.from_dict(tree))
+    for key, tree in fixtures.inventory().items():
+        if type(tree) is dict and "__spz_type__" in tree:
+            inv.attach(key, NativeStore.from_dict(tree))
     api, conn = connect(inv)
     v = U64()
     api.current_version(conn, C.byref(v))
@@ -181,4 +180,13 @@ def test_changes_and_versions_follow_lazy_loading():
     assert api.node(conn, log[0][4], srv, C.byref(info)) == OK and info.child_count == 0
     assert api.node(conn, log[1][4], srv, C.byref(info)) == OK and info.child_count == 2
     assert api.node(conn, start.value, srv, C.byref(info)) == NOT_FOUND  # before hapi existed
+    api.disconnect(conn)
+
+
+def test_installed_header_matches_the_binary():
+    with open(os.path.join(speasy_inventory_store.get_include(), "inventory_db.h")) as f:
+        header = f.read()
+    api, conn = connect(Inventory())
+    assert f"#define INVENTORY_DB_ABI_VERSION {api.abi_version}u" in header
+    assert '#define INVENTORY_DB_CAPSULE_NAME "speasy.inventory_db.v1"' in header
     api.disconnect(conn)

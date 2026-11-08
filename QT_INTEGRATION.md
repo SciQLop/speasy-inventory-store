@@ -1,7 +1,8 @@
 # Plugging the inventory store into Qt Model/View (SciQLop / SciQLopPlots)
 
-Status: research and prototype, 2026-11-08. Code: `src/inventory.rs`, `src/capi.rs`, `include/inventory_store.h`,
-`qt/`, `tests/test_inventory.py`, `tests/test_capi.py`, `bench/lazy_session.py`.
+Status: research and prototype, 2026-11-08. Since 2026-11-09 only the database-like C interface remains
+(`src/capi_db.rs`, `python/speasy_inventory_store/include/inventory_db.h`, `qt/DbModel.*`); sections describing the
+handle-based interface (`capi.rs`, `inventory_store.h`, `StoreModel`) are kept as the record of the comparison.
 
 ## Answer first
 

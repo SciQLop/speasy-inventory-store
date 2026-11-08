@@ -1,21 +1,18 @@
 """An inventory made of segments must look and search exactly like one store holding everything, while providers
 attach one by one, lazy nodes fill in, and providers get replaced."""
-import json
 import math
-import os
 
 import pytest
 
-from inventory_store import Inventory, NativeStore
+import fixtures
+from speasy_inventory_store import Inventory, NativeStore
 
-DATA = os.path.join(os.path.dirname(__file__), "..", "data", "inventory_v2.json")
 ROOT = 0
 
 
 @pytest.fixture(scope="module")
 def whole():
-    with open(DATA) as f:
-        return json.load(f)
+    return fixtures.inventory()
 
 
 def is_node(v):

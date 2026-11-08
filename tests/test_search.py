@@ -1,28 +1,26 @@
 """The store's search must give SciQLop's results: fuzzy scores and query parsing as SciQLopPlots computes them
-(tests/parity_sciqlopplots.json, generated with SciQLopPlots on real leaf texts), BM25F as SciQLop's Python."""
-import json
+(tests/data/parity_sciqlopplots.json.xz, generated with SciQLopPlots on real leaf texts), BM25F as SciQLop's Python."""
 import math
 import os
 
 import pytest
 
 import bm25_reference
-from inventory_store import NativeStore
-from inventory_store._native import parse_query, subsequence_score
+import fixtures
+from speasy_inventory_store import NativeStore
+from speasy_inventory_store._native import parse_query, subsequence_score
 
 HERE = os.path.dirname(__file__)
-DATA = os.path.join(HERE, "..", "data", "inventory_v2.json")
 
 
 @pytest.fixture(scope="module")
 def reference():
-    with open(os.path.join(HERE, "parity_sciqlopplots.json")) as f:
-        return json.load(f)
+    return fixtures.sciqlopplots_scores()
 
 
 @pytest.fixture(scope="module")
 def store():
-    s = NativeStore.from_json(open(DATA).read())
+    s = NativeStore.from_json(fixtures.inventory_text())
     s.build_search()
     return s
 

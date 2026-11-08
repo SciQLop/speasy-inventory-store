@@ -9,7 +9,6 @@
 //! Node ids are (segment << 32 | row). A filled node keeps its id: its content comes from the filling segment's root.
 //! Readers work on snapshots (an Arc). Each change makes a new snapshot and logs which child rows appeared or
 //! disappeared under which node, so a Qt model replays the changes with matching begin/end row signals.
-use crate::capi::Shared;
 use crate::search::{bm25_multi, display_name, node_desc, parse, Place, SearchIndex};
 use crate::store::{Meta, Store};
 use hashbrown::HashMap;
@@ -18,6 +17,20 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// One segment: a store plus what is derived from it lazily; shared by its Python object and the inventory.
+pub struct Shared {
+    pub store: Store,
+    pub search: OnceLock<SearchIndex>,
+    pub generation: u64,
+}
+
+impl Shared {
+    pub fn new(store: Store) -> Shared {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Shared { store, search: OnceLock::new(), generation: NEXT.fetch_add(1, Ordering::Relaxed) }
+    }
+}
 
 pub type NodeId = u64;
 pub const ROOT: NodeId = 0;

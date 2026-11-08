@@ -295,12 +295,12 @@ pysciqlop_cache and SciQLopPlots.
 ## Files
 
 - `src/`: Rust store (`interner.rs`, `store.rs`, `json.rs`, Python bindings in `lib.rs`).
-- `python/inventory_store/`: the two pure-Python stores (`columnar.py`, `blob.py`).
+- `bench/columnar.py`, `bench/blob.py`: the two pure-Python stores, kept for the benchmarks.
 - `tests/test_equivalence.py`: each store against speasy's trees.
 - `tests/test_search.py`, `tests/parity_sciqlopplots.json`, `tests/bm25_reference.py`: the search against SciQLopPlots and SciQLop.
 - `bench/search_bench.py`: search timings (`RAYON_NUM_THREADS=1` for one core).
 - `src/inventory.rs`, `tests/test_inventory.py`: the segmented inventory (lazy providers, lazy nodes, refreshes).
-- `QT_INTEGRATION.md`, `src/capi.rs`, `include/inventory_store.h`, `qt/`, `tests/test_capi.py`: sharing the inventory with C++/Qt through a PyCapsule, and a Qt model following its changes.
+- `QT_INTEGRATION.md`, `src/capi_db.rs`, `python/speasy_inventory_store/include/inventory_db.h`, `qt/`, `tests/test_capi_db.py`: sharing the inventory with C++/Qt through a PyCapsule, and a Qt model following its changes.
 - `bench/lazy_session.py`: a live speasy session with the Qt model attached; `bench/inventory_bench.py`: one store vs segments.
 - `bench/`: `bench.py` (one implementation per process), `clean_rss.py`, `run.py` (table).
 - Data, not committed:

@@ -1,11 +1,12 @@
-//! The database-like C interface (include/inventory_db.h): C/C++ holds no pointer into the inventory.
+//! The database-like C interface (inventory_db.h): C/C++ holds no pointer into the inventory.
 //!
 //! - One connection per consumer, an integer from a registry; everything else is plain values: node ids, versions.
 //! - A version is pinned by the connection (pin/unpin): its snapshot stays alive in the registry, not in the caller.
 //! - Results are copied out: into the caller's buffer, or through a callback whose strings are valid during the call.
 //! - Every entry point checks its arguments, catches panics, and returns a status; a wrong id is NOT_FOUND, never a
 //!   read of freed memory.
-use crate::capi::{meta_text, value_of, InvValue};
+use crate::json::value_json;
+use crate::store::{Store, Val, OTHER};
 use crate::inventory::{Change, Inventory, NodeId, Snapshot};
 use hashbrown::HashMap;
 use std::ffi::{c_char, c_void};
@@ -47,6 +48,71 @@ pub struct NodeInfo {
 }
 
 type Conn = u64;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InvStr {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl InvStr {
+    fn of(s: &str) -> InvStr {
+        InvStr { ptr: s.as_ptr(), len: s.len() }
+    }
+    const EMPTY: InvStr = InvStr { ptr: std::ptr::null(), len: 0 };
+}
+
+pub const INV_STR: u32 = 1;
+pub const INV_INT: u32 = 2;
+pub const INV_FLOAT: u32 = 3;
+pub const INV_BOOL: u32 = 4;
+pub const INV_NULL: u32 = 5;
+pub const INV_LIST: u32 = 6;
+pub const INV_TUPLE: u32 = 7;
+pub const INV_DICT: u32 = 8;
+pub const INV_OPAQUE: u32 = 9;
+
+#[repr(C)]
+pub struct InvValue {
+    pub kind: u32,
+    pub int_value: i64,
+    pub float_value: f64,
+    pub text: InvStr,
+}
+
+pub fn value_of(st: &Store, v: u32) -> InvValue {
+    let mut out = InvValue { kind: INV_NULL, int_value: 0, float_value: 0.0, text: InvStr::EMPTY };
+    if v & OTHER == 0 {
+        out.kind = INV_STR;
+        out.text = InvStr::of(st.s.str(v));
+        return out;
+    }
+    match st.other(v) {
+        Val::Str(id) => (out.kind, out.text) = (INV_STR, InvStr::of(st.s.str(*id))),
+        Val::Int(i) => (out.kind, out.int_value) = (INV_INT, *i),
+        Val::Float(f) => (out.kind, out.float_value) = (INV_FLOAT, *f),
+        Val::Bool(b) => (out.kind, out.int_value) = (INV_BOOL, *b as i64),
+        Val::Null => out.kind = INV_NULL,
+        Val::List(_) => out.kind = INV_LIST,
+        Val::Tuple(_) => out.kind = INV_TUPLE,
+        Val::Dict(_) => out.kind = INV_DICT,
+        Val::Opaque(i) => (out.kind, out.text) = (INV_OPAQUE, InvStr::of(st.opaque_text(*i))),
+    }
+    out
+}
+
+/// Any value as text: strings as is, scalars printed, composites as JSON.
+pub fn meta_text(st: &Store, v: u32) -> String {
+    if v & OTHER == 0 {
+        return st.s.str(v).to_owned();
+    }
+    match st.other(v) {
+        Val::Str(id) => st.s.str(*id).to_owned(),
+        Val::Opaque(i) => st.opaque_text(*i).to_owned(),
+        other => value_json(st, other),
+    }
+}
 
 #[repr(C)]
 pub struct InventoryDbApi {

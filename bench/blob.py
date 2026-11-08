@@ -5,7 +5,7 @@ the interned-string columnar store keeps its strings scattered over the arenas t
 import json
 from array import array
 
-from .columnar import NONE, SPZ_KEYS, _is_node
+from columnar import NONE, SPZ_KEYS, _is_node
 
 OTHER = 1 << 31
 

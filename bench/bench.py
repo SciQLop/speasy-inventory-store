@@ -15,7 +15,9 @@ from functools import reduce
 
 from speasy.core.inventory.indexes import SpeasyIndex, __INDEXES_TYPES__, from_dict, to_json
 
-from inventory_store import BlobStore, NativeStore, PyStore
+from blob import BlobStore
+from columnar import PyStore
+from speasy_inventory_store import NativeStore
 
 _libc = ctypes.CDLL("libc.so.6")
 PICKLE_PROTOCOLS = (3, 4, 5)

@@ -79,17 +79,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inventory_store"
-version = "0.1.0"
-dependencies = [
- "hashbrown",
- "pyo3",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -256,6 +245,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "speasy_inventory_store"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "pyo3",
+ "rayon",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
