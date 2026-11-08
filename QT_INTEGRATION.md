@@ -1,176 +1,197 @@
 # Plugging the inventory store into Qt Model/View (SciQLop / SciQLopPlots)
 
-Status: research and prototype, 2026-11-08. Code: `src/capi.rs`, `include/inventory_store.h`, `qt/`, `tests/test_capi.py`.
+Status: research and prototype, 2026-11-08. Code: `src/inventory.rs`, `src/capi.rs`, `include/inventory_store.h`,
+`qt/`, `tests/test_inventory.py`, `tests/test_capi.py`, `bench/lazy_session.py`.
 
 ## Answer first
 
-1. **Yes, SciQLopPlots can use the very store speasy holds: no copy, no second instance.**
-   - speasy's Python store object hands out a C function table in a PyCapsule.
-   - SciQLopPlots takes it once, keeps its own reference, and from then on reads the store from C++ without the GIL.
-   - It links nothing from speasy: no shared library, no ABI coupling, no Rust in SciQLopPlots' build.
-2. **A Qt model reads the store directly.** Each `QModelIndex` carries the store row id in `internalId()`, so there are no
-   node objects.
-   - The prototype `StoreModel` passes `QAbstractItemModelTester`.
-   - It walks all 115,574 nodes in 12 ms with no wrong parent.
-   - SciQLop's search runs through it in 174 ms.
-   - Tooltips are built on demand, 1,000 in 2 ms.
-3. **For SciQLopPlots' generic ProductsModel, mount the store as a subtree.** Start with lazy nodes, created only for the rows a view
-   visits, and send the filter models and search to the store. Tagged indexes without node objects can come later if needed.
+1. **SciQLopPlots can use the very inventory speasy holds: no copy, no second instance.**
+   - speasy's `Inventory` object hands out a versioned C function table in a PyCapsule.
+   - SciQLopPlots keeps its own reference and reads from C++ without the GIL.
+   - It links nothing from speasy.
+2. **The inventory grows while it's used, and the model follows it change by change.** speasy starts providers
+   lazily, HAPI fills servers and datasets on first access, and refreshes replace a provider.
+   - The inventory is one store made of immutable segments.
+   - Every change is logged with the snapshot it leads to.
+   - The Qt model replays each one with the right begin/end row signals, so untouched parts keep their indexes,
+     expansion and selection.
+3. **Checked in a live speasy session** (`bench/lazy_session.py`) with `QAbstractItemModelTester` watching every signal:
+   - CDA, AMDA and HAPI start on first use;
+   - 3 HAPI servers and 3 datasets load lazily;
+   - CDA is refreshed;
+   - no tester failure throughout, pinned indexes outside the changed parts stay valid, and search finds the new
+     products.
+4. **The performance holds:** the segmented inventory searches exactly like one store (same scores, same speed). The Qt
+   walk covers all 115,574 nodes in 19 ms.
 
-## 1. Sharing speasy's instance with C++
+## 1. One inventory made of segments
 
-### The protocol (prototype: `src/capi.rs`, `include/inventory_store.h`)
+speasy's inventory never exists all at once. From the code:
+- **Providers start on first access.** `speasy/inventories/__init__.py` routes `tree.<provider>` and
+  `flat_inventories.<provider>` to `_ensure_provider`, and so does `spz.<provider>`.
+- **Each provider refreshes on its own** (`update_inventory`).
+- **HAPI's servers and datasets are lazy nodes** (`_LazyIndex`): childless until first access. `load_into` then
+  replaces the node's content (metadata, the loaded flag, children).
+
+So the inventory (`src/inventory.rs`) is one logical store whose pieces are immutable segments (each one a `Store`):
+- **attached under the root, by key:** a provider's tree, when it starts. Attaching the same key again replaces it;
+- **filling a childless node:** a lazy node loading. The node keeps its id, and its content comes from the filling
+  segment's root.
+
+Node ids are `segment << 32 | row`, and the root is 0.
+- **Readers take a snapshot:** an `Arc`, immutable, read with no lock and no GIL.
+- **A change builds a new snapshot** (the segment table is small and cloned; segments are shared) and logs it:
+  `INSERTED`/`REMOVED` child rows `[position, position + count)` under a host, or `DATA` (the host's own data). A replaced
+  provider logs `REMOVED` then `INSERTED` at the same place, each step with its own snapshot.
+- **Search runs over every segment.** Each segment's index is built on first use, with its place in the tree, so the
+  path texts include the ancestors above it.
+  - Fuzzy results are a plain union.
+  - BM25F sums document counts, lengths and term frequencies across segments, so its scores equal one index built over
+    everything, which is what SciQLop does today. Tested equal to a single store, `tests/test_inventory.py`.
+
+Tested (`tests/test_inventory.py`, `tests/test_capi.py`):
+- the same tree as one store;
+- parents and rows consistent;
+- fuzzy and BM25F equal to one store;
+- lazy nodes fill in place, a fill's text inherits its ancestors;
+- refusing to fill what isn't a childless lazy node;
+- replacing a provider drops its fills and keeps its place;
+- the change log, step by step;
+- old snapshots never change;
+- one notification per change;
+- handles outlive the Python objects.
+
+## 2. Sharing speasy's instance with C++
 
 ```c
-// Python: capsule = store.__inventory_store_c_api__()
-const InventoryStoreApi* api = PyCapsule_GetPointer(capsule, "speasy.inventory_store.v1");
-// check api->abi_version == 1 and api->struct_size >= sizeof(InventoryStoreApi)
-InventoryStoreApi mine = *api;   // copy the table
-mine.retain(mine.handle);        // our reference: the capsule, and even the Python object, may now go away
-// ... any thread, no GIL: child_count / child / parent / row_in_parent / find_child / field /
-//     meta_count / meta_key / meta_value (typed) / meta_find / meta_text / search / bm25 ...
-mine.release(mine.handle);
+const InventoryApi* api = PyCapsule_GetPointer(inventory.__inventory_store_c_api__(), "speasy.inventory_store.v2");
+InventoryApi mine = *api;  mine.retain(mine.handle);       // keep it past the capsule
+InvSnapshot s = mine.snapshot(mine.handle);                // read s from any thread, no GIL
+token = mine.subscribe(mine.handle, notify, ctx);          // notify() runs on the changing thread: post an event
+mine.changes_since(mine.handle, last_seq, sink, ctx);      // on your thread: replay each change with its snapshot
 ```
 
-**Lifetime is a plain reference count** on the shared store (an `Arc`):
-- The capsule owns one reference and drops it when Python frees it.
-- A consumer takes its own with `retain`.
+- **Lifetime is plain reference counting:** the inventory and the snapshots are `Arc`s.
+- **`unsubscribe` waits for a notification in progress,** so a consumer can be destroyed right after it.
+- **Strings are borrowed UTF-8** and live as long as the snapshot.
+- **Versioning:** the capsule name carries the major version; `abi_version` and `struct_size` let later versions only append.
+- **The table is one plain C header** (`include/inventory_store.h`). SciQLopPlots can vendor it: the ABI is versioned and only
+  grows.
 
-Tested: a retained store keeps working after the Python object is deleted.
+Why a PyCapsule: it's the pattern NumPy (`_ARRAY_API`), CPython (`PyDateTime_CAPI`) and Arrow (`__arrow_c_stream__`)
+use to share native objects between extensions.
+- **There's no link-time dependency,** so there are no two copies of a library and no DLL search issues on Windows or macOS.
+- **Neither side's toolchain leaks** into the other's build.
 
-**Immutability is what makes GIL-free reads safe.**
-- Once a store has been shared, the Python side refuses to modify it (tested).
-- A refreshed inventory is a new store, with a new `generation()`.
-- Opaque metadata values (Python objects with no C form) only reach C as text.
+The alternatives:
+- linking speasy's library from SciQLopPlots;
+- the Arrow C Data Interface (navigation, typed heterogeneous metadata and search don't map onto it);
+- calling Python from each `data()` (the GIL on the GUI thread);
+- copying, which is what happens today.
 
-**Strings are borrowed UTF-8** (pointer + length), valid while the reference is held. `QString::fromUtf8` converts them only when
-a view asks.
+All four are worse.
 
-**Versioning:**
-- the capsule name carries the major version;
-- the table starts with `abi_version` and `struct_size`;
-- later versions only append members. An old SciQLopPlots then still works with a newer speasy, and the reverse is detected.
+From Python to C++: SciQLopPlots' Shiboken bindings already take raw Python objects through custom primitive types
+(`SciQLopPyBuffer`, `GetDataPyCallable` in `bindings.xml`). Something like
+`ProductsModel.instance().mount_inventory(["speasy"], spz.inventories.store())` would follow that pattern.
 
-### Why this, and not the alternatives
+## 3. The Qt model (prototype: `qt/StoreModel.{hpp,cpp}`)
 
-| option | verdict |
+| QAbstractItemModel | from the inventory snapshot |
 |---|---|
-| PyCapsule with a versioned C table (NumPy's `_ARRAY_API`, CPython's `PyDateTime_CAPI`, Arrow's `__arrow_c_stream__` all do this) | **chosen**: no link-time dependency, one instance, works on Linux, macOS and Windows, language-neutral |
-| SciQLopPlots links speasy's native library | two loaded copies or DLL search problems on Windows and macOS, version skew between the two packages, and a Rust/C++ build dependency in SciQLopPlots |
-| Arrow C Data Interface for the columns | standard and zero-copy for flat columns, but navigation, typed heterogeneous metadata and search don't map onto it |
-| C++ calls back into Python for every `data()` | the GIL on the GUI thread for every paint, and a risk of stalls with the Jupyter kernel's threads |
-| Copy into SciQLopPlots (today) | the inventory exists twice; this is what we're removing |
+| `index(r, c, parent)` | `child(parent_node, r)` → `createIndex(r, c, quintptr(node))` |
+| `parent(index)` | `parent(node)`, plus `row_in_parent(parent)` (O(log n): siblings are sorted) |
+| `rowCount` / `hasChildren` | `child_count(node)`, O(1) |
+| `data(DisplayRole)` | SciQLop's rule: `name` metadata unless it's "AMDA", else the key |
+| `data(ToolTipRole)` | built on demand (1,000 in 2 ms), where SciQLop precomputes 77k today |
+| `flags` | drag-enabled for parameter kinds; leaves are recognized by kind, since a lazy node has no children until it loads |
+| changes | `subscribe` → a queued `sync()` → `changes_since` → `beginInsertRows`/`beginRemoveRows` on the old snapshot, switch, `end…` |
 
-### Distributing the header
+**Threading:**
+- the notification only queues a sync on the model's thread;
+- reads need no lock;
+- if the model falls behind the log (4096 changes), it resets.
 
-`inventory_store.h` is one self-contained C header (about 100 lines). Two options:
-- Ship it in speasy's wheel with a `get_include()` function, the NumPy pattern. SciQLopPlots' meson build would then ask
-  Python for the path.
-- Or vendor it into SciQLopPlots.
+### The live session (`bench/lazy_session.py`)
 
-Since the ABI is versioned and only grows, vendoring is fine and keeps SciQLopPlots' build independent of speasy's.
+Run in the speasy worktree with `SPEASY_STORE_VIEWS=1`. The model is attached before anything is loaded, and
+`QAbstractItemModelTester` watches it.
 
-### Getting the store from Python to C++
+| step | time | model |
+|---|---|---|
+| attach, nothing loaded | — | 0 top rows |
+| `spz.inventories.tree.cda` | 2.0 s | 1 row inserted; walk of 73,585 nodes in 10 ms |
+| `spz.inventories.tree.amda` | 0.8 s | 1 row inserted; the CDA pin stays valid |
+| `spz.inventories.tree.hapi` | 0.0 s | 1 row inserted (servers, unloaded) |
+| `dir(tree.hapi.intermagnet)` loads it | 0.6 s | 154 children inserted under the server; DATA on the server |
+| `list(<intermagnet dataset>)` loads it | 0.03 s | 3 parameters inserted under the dataset |
+| lisird, then das2, and one dataset each | 0.5–1.9 s | the same: rows inserted in place |
+| `spz.cda.update_inventory()` | 2.0 s | CDA removed, then inserted at the same row; the AMDA pin stays valid |
 
-SciQLopPlots' Shiboken bindings already accept raw Python objects through custom primitive types (`SciQLopPyBuffer`,
-`GetDataPyCallable` in `bindings.xml`). The same pattern fits:
+Throughout, the tester reported only its warning about type id 4097. It comes from running without Qt GUI: a stock
+`QStringListModel` shows it too in a fresh process. The final walk covers 92,559 nodes in 13 ms.
 
-```python
-# SciQLop's speasy plugin
-ProductsModel.instance().mount_store(["speasy", "cda"], spz.inventories.store("cda"))
-```
+**What a refresh does to the view:** the refreshed provider's subtree is replaced, so what was expanded *inside* it
+collapses. Other providers keep everything. Today SciQLop never rebuilds its tree, so a refresh never reaches it at
+all. Two ways to keep expansion across a refresh:
+- SciQLop re-expands by key path after the change, since key paths are stable;
+- the inventory diffs the new tree against the old one by key path and logs finer changes. That's more work, and not
+  done here.
 
-The C++ side calls `__inventory_store_c_api__()` once under the GIL and retains the store. After that it never touches Python.
+### Performance on the full inventory (`bench/inventory_bench.py`, 16 threads)
 
-## 2. The Qt model (prototype: `qt/StoreModel.{hpp,cpp}`)
+| | one store | segmented inventory |
+|---|---|---|
+| fuzzy `mms1 fgm bgse` | 171 ms | 140 ms |
+| fuzzy `provider:cda after:2020 b_gse` | 40 ms | 37 ms |
+| fuzzy `magnetic field vector` | 291 ms | 223 ms |
+| BM25F queries | 2.1–2.4 ms | 1.5–2.6 ms |
+| first search (builds the indexes) | 0.07 s* | 0.28 s |
+| RSS, store + search index | 148 MB | 157 MB |
+| Qt walk, 115,574 nodes | — | 19 ms |
 
-| QAbstractItemModel member | from the store |
-|---|---|
-| `index(r, c, parent)` | `child(parent_row, r)` → `createIndex(r, c, quintptr(row))` (verified: `createIndex(int, int, quintptr)`) |
-| `parent(index)` | `parent(row)`, plus `row_in_parent(parent)` for the parent's `QModelIndex::row()`. That's O(log n): siblings are stored sorted |
-| `rowCount` / `hasChildren` | `child_count(row)`: O(1), so no `canFetchMore`/`fetchMore` is needed for in-memory stores |
-| `flags` | leaves: `ItemIsDragEnabled | ItemNeverHasChildren` |
-| `data(DisplayRole)` | SciQLop's rule: `name` metadata unless it's "AMDA", else the attribute key |
-| `data(ToolTipRole)` | built on demand from `meta_key` / `meta_text`, the same HTML SciQLop precomputes today for all 77k nodes |
-| `data(UserRole)` | the key, SciQLop's identity role for path lookups |
-| search | `search(query)` / `bm25(text)` → `(row, score)`; `index_of(row)` turns a hit into an index |
+\* the single store's index was built before this measurement, by `build_search()`.
 
-Measured from a C++ extension in the same interpreter as speasy, with the GIL released (`qt/module.cpp`):
-- `QAbstractItemModelTester` passes in 25 ms. Its single warning (type id 4097, a Qt GUI type) also shows up on a stock
-  `QStringListModel`, so it comes from running the tester without Qt GUI, not from the model.
-- A full walk takes 12 ms for 115,574 indexes, `data(DisplayRole)` included, with `parent(index(r, 0, p)) == p` everywhere.
-- Search: 174 ms for `mms1 fgm bgse` on 16 threads, 78,915 hits. A hit's `index_of(row)` points back at the same row.
-- 1,000 tooltips built on demand take 2 ms.
+**Memory: the search index used to cost more than it showed.** It held 77 MB but added 151 MB to the process: the
+build's garbage (every leaf's term strings, postings grown by doubling) stayed scattered after being freed. It now
+keeps terms as 64-bit hashes and builds one exactly-sized flat postings array in bounded chunks. It holds 52 MB, adds
+about 72–80 MB, and builds in 0.28 s on 16 threads, against 0.5 s before. The store itself is unchanged at 66 MB.
 
-**Threading:** a Qt model belongs to one thread (the GUI thread), and model signals must be emitted there. Reads need no lock,
-because the store is immutable. Swapping in a refreshed store (`set_store`) must run on the model thread: speasy notifies from
-wherever it refreshes, and the plugin queues the swap with `QMetaObject::invokeMethod(..., Qt::QueuedConnection)`.
+## 4. Fitting it into SciQLopPlots' ProductsModel
 
-## 3. Fitting it into SciQLopPlots' ProductsModel
+ProductsModel is generic: plugins add `ProductsModelNode`s. Everything assumes `internalPointer()` is one: the model,
+both filter models (they hash by node pointer), `ProductsModel.node(path)` (Python reads `metadata()` from it), and the
+search snapshot.
 
-ProductsModel is generic: plugins add their own `ProductsModelNode`s, and that must keep working. Today
-`internalPointer()` is always a `ProductsModelNode*`. That's assumed by the model, by both filter models (which hash by node
-pointer), by `ProductsModel.node(path)` (which returns the QObject Python reads `metadata()` from), and by the search snapshot.
+**Option B, first: lazy store-backed nodes.** A `StoreNode : ProductsModelNode` holds `(inventory, node id)`.
+- **Its children are created when Qt asks for them.** Its accessors (`metadata`, `tooltip`, `raw_text`, `display_name`) read
+  the snapshot.
+- **Existing code keeps getting `ProductsModelNode*`.** Objects exist only for what is expanded.
+- **The inventory's change log drives the store-backed subtree:** insert or remove the StoreNodes the model has created.
+- **The full-corpus walks have to ask the inventory instead,** otherwise they would create every node:
+  - `collect_all_leaves`, in both filter models;
+  - `corpus_snapshot`;
+  - the autocompletion walk.
 
-### Option B, first: lazy store-backed nodes
-
-A `StoreNode : ProductsModelNode` holds `(store, row)`.
-- **Its children** are created when Qt first asks for them (`rowCount`/`index` on that node), and kept.
-- **Its accessors read the store:** `metadata()`, `tooltip()`, `raw_text()` and `display_name()`. They become virtual, or branch on
-  a store pointer.
-- **Every existing code path keeps getting `ProductsModelNode*`:** `node(path)`, drag and drop, Python's `metadata("speasy_id")`, the plugins.
-- **Objects exist only for what a user expands:** a few hundred, instead of 77k QObjects with QVariantMaps, tooltips and search texts built at startup.
-
-What has to change at the same time are the **full-corpus walks**, which would otherwise create every node:
-- `collect_all_leaves`, in both filter models;
-- `corpus_snapshot`, used by SciQLop's smart search;
-- the autocompletion walk in `ProductsView`.
-
-For store-backed subtrees they ask the store instead:
-- **the flat model** lists `search()` hits;
-- **the tree filter model** accepts a row if it, or a descendant, is a hit. That's the hits plus their ancestors, O(hits × depth)
-  to compute;
-- **completion** asks for distinct values, a store query to add.
-
-### Option A, later if needed: tagged indexes, no node objects
-
-`internalId()` would carry either a node pointer (aligned, so the low bit is 0) or `(mount << 33) | (row << 1) | 1`.
+**Option A, later if needed: tagged indexes, no node objects.** `internalId` carries a node pointer (low bit 0) or a
+tagged inventory node id.
 - **Every model member branches on the tag.**
-- **The filter models key their per-item state** by a small `ProductRef {node*, mount, row}` instead of `ProductsModelNode*`.
-- **`node(path)`** returns a cached node created on demand.
+- **The filter models key their per-item state** by a small `ProductRef`.
 
-This removes the last objects, but touches every place that casts `internalPointer()`. It also needs a 64-bit `quintptr`;
-SciQLop's desktop targets have one.
+This removes the last objects, but touches every cast of `internalPointer()`.
 
-**Recommendation:** B. It changes less, it removes the memory and startup cost that matter, and A remains possible
-afterwards without changing speasy's side.
+**Recommendation:** B, then A if profiling asks for it. speasy's side doesn't change either way.
 
-### Refresh and lazy segments
+**Search:**
+- **The inventory returns `(node, raw score)`** for the fuzzy and BM25F signals. SciQLop keeps fusing them with its
+  embeddings; the stable keys are `speasy_id`, or the key path.
+- **Plugin and virtual-product nodes** aren't in speasy's inventory. SciQLop keeps a small corpus for them, or they get
+  mounted as segments too.
 
-- **One store per provider,** each mounted as a subtree. A provider refresh in speasy gives a new store. Speasy has to expose a hook
-  (for example `spz.inventories.on_update(callback)`); the plugin then swaps that mount: `beginResetModel` for the subtree, or
-  remove rows + insert rows under the mount.
-  - **To keep the expanded and selected state across a swap,** re-resolve it by key path. The paths are stable, and node pointers
-    weren't preserved before either.
-- **HAPI servers and datasets load on first access.** That maps onto Qt's own lazy loading:
-  - the mount reports `canFetchMore` until it's loaded;
-  - `fetchMore` asks speasy to load the server, off the GUI thread;
-  - the new segment arrives with `beginInsertRows`/`endInsertRows`.
+## What this doesn't cover yet
 
-  This is the per-segment store from DESIGN.md.
-
-### Search, scores and SciQLop's smart search
-
-The store returns `(row, raw score)` for the fuzzy and BM25F signals. SciQLop keeps fusing them with the embeddings, which it
-keys by `path_key` today; `speasy_id` or `(mount, row)` would be stable keys.
-- **The BM25 build moves out of the subprocess:** the store builds it in 0.5 s, on first use.
-- **Plugin and virtual-product nodes** aren't in speasy's store. SciQLop keeps its own small corpus for them, or a later version adds an
-  ingest path.
-
-## What the prototype doesn't cover
-
-- **A Shiboken binding and SciQLopPlots' real ProductsModel:** the prototype model is standalone. That's the next step if this direction is kept.
-- **Change notification from speasy** (the update hook) and multi-segment mounting.
-- **A view on screen:** the tests use `QCoreApplication`, a model tester and a programmatic walk. Painting adds nothing on the store's side;
-  `data()` is the same call.
-- **Windows and macOS builds** of the capsule path (nothing platform-specific is involved, but it wasn't built there).
+- **The Shiboken binding and SciQLopPlots' real ProductsModel:** the prototype model is standalone.
+- **A refresh that keeps expansion inside the refreshed provider** (re-expand by key path, or diffed changes).
+- **Building the search indexes ahead of time:** the first search after new segments pays for their build, about 0.3 s
+  for everything.
+- **Builds on Windows and macOS.**

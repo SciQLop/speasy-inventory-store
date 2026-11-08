@@ -7,24 +7,42 @@
 //! The text of a leaf follows SciQLop's speasy plugin: path = display names from the provider down, joined by ' ';
 //! meta = name, then " key: value" for each scalar metadata, sorted by key (a QMap), then the plugin's extra keys.
 use crate::store::{Meta, Store, Val};
-use hashbrown::HashMap;
+use hashbrown::{DefaultHashBuilder, HashMap};
+use std::hash::BuildHasher;
 use rayon::prelude::*;
 use std::cell::RefCell;
 
+/// Where a store's nodes sit in the whole inventory: their search texts include what is above the store's root.
+#[derive(Clone, Default)]
+pub struct Place {
+    /// display names above the store's root, from the top of the inventory down
+    pub above: Vec<String>,
+    /// descriptions inherited from those ancestors
+    pub above_desc: Vec<String>,
+    /// the store root's display name; None: the root isn't shown (a standalone store, whose root is "all")
+    pub root_name: Option<String>,
+}
+
 /// Leaf texts are not kept (they would be ~150 MB): each search regenerates them, which costs less than scoring them.
+/// Postings are one flat array (CSR by term), sized exactly: building leaves no garbage behind.
 pub struct SearchIndex {
     pub leaves: Vec<u32>,
-    terms: HashMap<Box<str>, u32>,
-    postings: Vec<Vec<(u32, u16, u16)>>, // term -> (leaf, tf in path, tf in meta)
+    pub place: Place,
+    hasher: DefaultHashBuilder,
+    // simplify: a term is its 64-bit hash, no string kept; two terms colliding (~1e-8 for 300k terms) would share
+    // postings. Keep the strings (or check them on lookup) if that ever matters.
+    terms: HashMap<u64, u32>,
+    post_start: Vec<u32>,
+    postings: Vec<(u32, u16, u16)>, // (leaf, tf in path, tf in meta), grouped by term
     path_len: Vec<u32>,
     meta_len: Vec<u32>,
-    path_avgdl: f64,
-    meta_avgdl: f64,
+    path_total: f64,
+    meta_total: f64,
 }
 
 // ---------- leaf texts ----------
 
-fn display_name(st: &Store, row: u32) -> String {
+pub fn display_name(st: &Store, row: u32) -> String {
     match st.get(row, "name") {
         Some(Meta::Str(n)) if n != "AMDA" => n.to_owned(),
         _ => st.key(row).to_owned(),
@@ -43,25 +61,34 @@ fn scalar_text(st: &Store, m: &Meta) -> Option<String> {
     }
 }
 
-fn ancestors(st: &Store, row: u32) -> Vec<u32> {
+/// Ancestors of `row` inside its store, top first; the store root only when the place shows it.
+fn ancestors(st: &Store, row: u32, place: &Place) -> Vec<u32> {
     let mut chain: Vec<u32> = std::iter::successors(st.parent(row), |&p| st.parent(p)).collect();
-    chain.pop(); // the store root ("all") is not shown in SciQLop
+    if place.root_name.is_none() {
+        chain.pop();
+    }
     chain.reverse();
     chain
 }
 
-pub fn leaf_texts(st: &Store, row: u32) -> (String, String) {
-    let chain = ancestors(st, row);
+pub fn node_desc(st: &Store, row: u32) -> Option<String> {
+    match st.get(row, "desc").or_else(|| st.get(row, "description")) {
+        Some(Meta::Str(d)) if !d.is_empty() => Some(d.to_owned()),
+        _ => None,
+    }
+}
+
+pub fn leaf_texts(st: &Store, row: u32, place: &Place) -> (String, String) {
+    let chain = ancestors(st, row, place);
     let name = display_name(st, row);
-    let path = chain.iter().map(|&a| display_name(st, a)).chain([name.clone()]).collect::<Vec<_>>().join(" ");
-    let description = chain
-        .iter()
-        .filter_map(|&a| match st.get(a, "desc").or_else(|| st.get(a, "description")) {
-            Some(Meta::Str(d)) if !d.is_empty() => Some(d.to_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let shown = |a: u32| match (&place.root_name, a) {
+        (Some(root), 0) => root.clone(),
+        _ => display_name(st, a),
+    };
+    let path = place.above.iter().cloned().chain(chain.iter().map(|&a| shown(a))).chain([name.clone()])
+        .collect::<Vec<_>>().join(" ");
+    let description = place.above_desc.iter().cloned().chain(chain.iter().filter_map(|&a| node_desc(st, a)))
+        .collect::<Vec<_>>().join(" ");
     let speasy_id = format!("{}/{}", st.provider(row), st.uid(row));
     let mut fields: Vec<(String, String)> = st
         .meta(row)
@@ -105,66 +132,93 @@ fn tokens(text: &str) -> impl Iterator<Item = String> + '_ {
     out.into_iter()
 }
 
-impl SearchIndex {
-    pub fn build(st: &Store, leaf_kinds: &[&str]) -> SearchIndex {
-        let leaves: Vec<u32> = (0..st.len() as u32).filter(|&r| leaf_kinds.contains(&st.kind(r))).collect();
-        // per leaf: its (term, tf path, tf meta) list, in parallel; then one sequential pass assigns term ids
-        let docs: Vec<Vec<(String, u16, u16)>> = leaves
-            .par_iter()
-            .map(|&row| {
-                let (path, meta) = leaf_texts(st, row);
-                let mut tf: HashMap<String, (u16, u16)> = HashMap::new();
-                for t in tokens(&path) {
-                    tf.entry(t).or_default().0 += 1;
-                }
-                for t in tokens(&meta) {
-                    let e = tf.entry(t).or_default();
-                    e.1 = e.1.saturating_add(1);
-                }
-                tf.into_iter().map(|(t, (p, m))| (t, p, m)).collect()
-            })
-            .collect();
-        let mut terms: HashMap<Box<str>, u32> = HashMap::new();
-        let mut postings: Vec<Vec<(u32, u16, u16)>> = Vec::new();
-        let (mut path_len, mut meta_len) = (Vec::with_capacity(leaves.len()), Vec::with_capacity(leaves.len()));
-        for (doc, entries) in docs.into_iter().enumerate() {
-            let (np, nm) = entries.iter().fold((0u32, 0u32), |(a, b), (_, p, m)| (a + *p as u32, b + *m as u32));
-            for (t, p, m) in entries {
-                let next = terms.len() as u32;
-                let id = *terms.entry(t.into_boxed_str()).or_insert(next);
-                if id as usize == postings.len() {
-                    postings.push(Vec::new());
-                }
-                postings[id as usize].push((doc as u32, p, m));
+/// Same tokens as `tokens`, as slices of one lowered buffer: no allocation per token.
+fn for_each_token(text: &str, mut f: impl FnMut(&str)) {
+    let lowered: String = text.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
+    let bytes = lowered.as_bytes();
+    let mut start = None;
+    for (i, b) in bytes.iter().chain([&b' ']).enumerate() {
+        match (b.is_ascii_lowercase() || b.is_ascii_digit(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                f(&lowered[s..i]);
+                start = None;
             }
-            path_len.push(np);
-            meta_len.push(nm);
+            _ => {}
         }
-        let avg = |v: &[u32]| if v.is_empty() { 1.0 } else { v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64 };
-        let (path_avgdl, meta_avgdl) = (avg(&path_len), avg(&meta_len));
-        SearchIndex { leaves, terms, postings, path_len, meta_len, path_avgdl, meta_avgdl }
+    }
+}
+
+const BUILD_CHUNK: usize = 8192;
+
+/// One leaf's terms: (term hash, tf in path, tf in meta).
+fn leaf_terms(st: &Store, row: u32, place: &Place, hasher: &DefaultHashBuilder) -> Vec<(u64, u16, u16)> {
+    let (path, meta) = leaf_texts(st, row, place);
+    let mut tf: HashMap<u64, (u16, u16)> = HashMap::new();
+    for_each_token(&path, |t| tf.entry(hasher.hash_one(t)).or_default().0 += 1);
+    for_each_token(&meta, |t| {
+        let e = tf.entry(hasher.hash_one(t)).or_default();
+        e.1 = e.1.saturating_add(1);
+    });
+    tf.into_iter().map(|(h, (p, m))| (h, p, m)).collect()
+}
+
+impl SearchIndex {
+    pub fn build(st: &Store, leaf_kinds: &[&str], place: Place) -> SearchIndex {
+        let leaves: Vec<u32> = (0..st.len() as u32).filter(|&r| leaf_kinds.contains(&st.kind(r))).collect();
+        let hasher = DefaultHashBuilder::default();
+        let mut terms: HashMap<u64, u32> = HashMap::with_capacity(leaves.len() * 4);
+        let mut df: Vec<u32> = Vec::with_capacity(leaves.len() * 4);
+        let mut fwd = Vec::<(u32, u16, u16)>::with_capacity(leaves.len() * 100); // ~100 distinct terms per leaf
+        let mut fwd_start = Vec::with_capacity(leaves.len() + 1);
+        fwd_start.push(0u32);
+        let (mut path_len, mut meta_len) = (Vec::with_capacity(leaves.len()), Vec::with_capacity(leaves.len()));
+        // texts are tokenized in parallel, a bounded chunk at a time; term ids are given in leaf order
+        for chunk in leaves.chunks(BUILD_CHUNK) {
+            let docs: Vec<Vec<(u64, u16, u16)>> =
+                chunk.par_iter().map(|&row| leaf_terms(st, row, &place, &hasher)).collect();
+            for doc in docs {
+                let (mut np, mut nm) = (0u32, 0u32);
+                for (h, p, m) in doc {
+                    let id = *terms.entry(h).or_insert_with(|| {
+                        df.push(0);
+                        (df.len() - 1) as u32
+                    });
+                    df[id as usize] += 1;
+                    fwd.push((id, p, m));
+                    (np, nm) = (np + p as u32, nm + m as u32);
+                }
+                fwd_start.push(fwd.len() as u32);
+                path_len.push(np);
+                meta_len.push(nm);
+            }
+        }
+        let mut post_start = Vec::with_capacity(df.len() + 1);
+        post_start.push(0u32);
+        for &d in &df {
+            post_start.push(post_start.last().unwrap() + d);
+        }
+        let mut next = post_start.clone();
+        let mut postings = vec![(0u32, 0u16, 0u16); fwd.len()];
+        for doc in 0..leaves.len() {
+            for &(id, p, m) in &fwd[fwd_start[doc] as usize..fwd_start[doc + 1] as usize] {
+                postings[next[id as usize] as usize] = (doc as u32, p, m);
+                next[id as usize] += 1;
+            }
+        }
+        let total = |v: &[u32]| v.iter().map(|&x| x as f64).sum::<f64>();
+        let (path_total, meta_total) = (total(&path_len), total(&meta_len));
+        SearchIndex { leaves, place, hasher, terms, post_start, postings, path_len, meta_len, path_total, meta_total }
+    }
+
+    fn posting(&self, term: &str) -> Option<&[(u32, u16, u16)]> {
+        let id = *self.terms.get(&self.hasher.hash_one(term))? as usize;
+        Some(&self.postings[self.post_start[id] as usize..self.post_start[id + 1] as usize])
     }
 
     /// (leaf index, raw BM25F score) for every leaf matching at least one term.
     pub fn bm25(&self, query: &str) -> Vec<(usize, f64)> {
-        let n_docs = self.leaves.len() as f64;
-        let avgdl = W_PATH * self.path_avgdl + W_META * self.meta_avgdl;
-        let mut scores = vec![0.0f64; self.leaves.len()];
-        let mut hit = vec![false; self.leaves.len()];
-        for term in tokens(query) {
-            let Some(&id) = self.terms.get(term.as_str()) else { continue };
-            let posting = &self.postings[id as usize];
-            let n = posting.len() as f64;
-            let idf = ((n_docs - n + 0.5) / (n + 0.5) + 1.0).ln();
-            for &(doc, p, m) in posting {
-                let d = doc as usize;
-                let tf = W_PATH * p as f64 + W_META * m as f64;
-                let doc_len = W_PATH * self.path_len[d] as f64 + W_META * self.meta_len[d] as f64;
-                scores[d] += idf * (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * doc_len / avgdl));
-                hit[d] = true;
-            }
-        }
-        (0..scores.len()).filter(|&d| hit[d]).map(|d| (d, scores[d])).collect()
+        bm25_multi(&[self], query).into_iter().map(|(_, leaf, score)| (leaf, score)).collect()
     }
 
     /// (leaf index, fuzzy score) of the leaves passing the filters with a non-zero score, like the flat filter model.
@@ -178,7 +232,7 @@ impl SearchIndex {
                 if lowered.is_empty() {
                     return (i, 1);
                 }
-                let (path, meta) = leaf_texts(st, row);
+                let (path, meta) = leaf_texts(st, row, &self.place);
                 (i, free_text_score(&lowered, &path, &meta))
             })
             .filter(|&(_, s)| s > 0)
@@ -187,10 +241,50 @@ impl SearchIndex {
 
     pub fn heap_bytes(&self) -> usize {
         self.leaves.capacity() * 4
-            + self.terms.keys().map(|k| k.len() + 24).sum::<usize>()
-            + self.postings.iter().map(|p| p.capacity() * 8 + 24).sum::<usize>()
-            + self.path_len.capacity() * 8
+            + self.terms.capacity() * 13
+            + self.post_start.capacity() * 4
+            + self.postings.capacity() * 8
+            + (self.path_len.capacity() + self.meta_len.capacity()) * 4
     }
+}
+
+/// BM25F over several indexes as if they were one corpus: document count, average lengths and term document
+/// frequencies are summed across them, so scores equal one index built over everything (SciQLop's single index).
+/// Returns (index position, leaf index, raw score).
+pub fn bm25_multi(indexes: &[&SearchIndex], query: &str) -> Vec<(usize, usize, f64)> {
+    let n_docs: f64 = indexes.iter().map(|i| i.leaves.len() as f64).sum();
+    if n_docs == 0.0 {
+        return Vec::new();
+    }
+    let path_avgdl = indexes.iter().map(|i| i.path_total).sum::<f64>() / n_docs;
+    let meta_avgdl = indexes.iter().map(|i| i.meta_total).sum::<f64>() / n_docs;
+    let avgdl = W_PATH * path_avgdl + W_META * meta_avgdl;
+    let mut scores: Vec<Vec<f64>> = indexes.iter().map(|i| vec![0.0; i.leaves.len()]).collect();
+    let mut hits: Vec<Vec<bool>> = indexes.iter().map(|i| vec![false; i.leaves.len()]).collect();
+    for term in tokens(query) {
+        let postings: Vec<Option<&[(u32, u16, u16)]>> = indexes.iter().map(|i| i.posting(&term)).collect();
+        let n = postings.iter().flatten().map(|p| p.len() as f64).sum::<f64>();
+        if n == 0.0 {
+            continue;
+        }
+        let idf = ((n_docs - n + 0.5) / (n + 0.5) + 1.0).ln();
+        for (x, posting) in postings.iter().enumerate() {
+            let index = indexes[x];
+            for &(doc, p, m) in posting.iter().flat_map(|p| p.iter()) {
+                let d = doc as usize;
+                let tf = W_PATH * p as f64 + W_META * m as f64;
+                let doc_len = W_PATH * index.path_len[d] as f64 + W_META * index.meta_len[d] as f64;
+                scores[x][d] += idf * (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * doc_len / avgdl));
+                hits[x][d] = true;
+            }
+        }
+    }
+    (0..indexes.len())
+        .flat_map(|x| {
+            let (s, h) = (&scores[x], &hits[x]);
+            (0..s.len()).filter(move |&d| h[d]).map(move |d| (x, d, s[d]))
+        })
+        .collect()
 }
 
 // ---------- fuzzy subsequence matcher (SubsequenceMatcher.hpp) ----------

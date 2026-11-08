@@ -113,10 +113,18 @@ Tests (`tests/test_equivalence.py`, 22 of them):
 - the same holds for the trees speasy builds locally for AMDA, CDA, CSA, SSC, 3DView and UiowaEphTool;
 - every value type, opaque ones included, keeps its type.
 
-Open design point: **lazily loaded subtrees.**
-- HAPI fills servers and datasets on first access, and a refresh replaces a whole provider. A single CSR array can't be appended to.
-- Proposal: immutable segments, one per provider (and one per HAPI server or loaded dataset), each a store of its own, linked from a parent row.
-  A refresh swaps a segment, and readers keep the old one until they drop it.
+**Lazy loading: one inventory made of segments** (`src/inventory.rs`, details in QT_INTEGRATION.md).
+
+speasy's inventory never exists all at once:
+- providers start on first access (`inventories/__init__.py` → `_ensure_provider`) and refresh independently;
+- HAPI's servers and datasets fill in on first access.
+
+A single store, frozen once, can't follow that. So the inventory is one logical store made of immutable segments:
+- **a provider's tree is attached under the root** when it starts, and a refresh replaces it;
+- **a lazy node is filled in place** by a segment holding its new content, and keeps its id.
+
+Each change publishes a new snapshot and logs which rows appeared or disappeared, so Qt models follow it without
+resetting. Search over the segments gives exactly the results of one store, BM25F included (corpus-wide statistics).
 
 ## Migration path
 
@@ -160,9 +168,17 @@ Results:
   - Getting the rest means building the store straight from the proxy's version 2 JSON (`NativeStore.from_json`, 66 MB for everything
     including HAPI), with providers writing through `add()`.
 
+With the segmented inventory (second round):
+- every provider's tree is attached to one shared `Inventory` when it starts, HAPI included;
+- a HAPI server or dataset that loads becomes a segment filling its node;
+- the flat inventory gets the views of the loaded nodes;
+- lazy loading through attribute access, `dir()` and iteration works on views;
+- a node of a tree replaced during its load still fills and browses, as speasy's `_publish` rule says, but stays out of
+  the current inventory.
+
+speasy's full suite passes with views, HAPI's lazy loading included: 1941 passed.
+
 Not covered:
-- **HAPI.** It has its own `update_inventory` and fills servers and datasets on first access, so it isn't frozen. This
-  needs the per-segment store.
 - **SciQLop's plugin**, which wasn't run itself (it needs the Qt stack). Its access patterns were replayed instead.
 - **The plugin's `_register_nodes` patch.** It wraps `ProviderInventory._register_nodes` and reads, but doesn't write.
 
@@ -194,8 +210,8 @@ Parity (`tests/test_search.py`):
 | fuzzy, `mms1 fgm bgse` | 1.88 s | 1.08 s | 0.14 s |
 | fuzzy, `magnetic field vector` | 2.80 s | 1.73 s | 0.23 s |
 | fuzzy, `provider:cda after:2020 b_gse` | — | 0.26 s | 0.04 s |
-| BM25F index build | 3.3 s (Python, in a subprocess, on every model change) | 1.6 s | 0.5 s |
-| BM25F index memory | 286 MB (Python dicts) | 77 MB | 77 MB |
+| BM25F index build | 3.3 s (Python, in a subprocess, on every model change) | 1.4 s | 0.28 s |
+| BM25F index memory | 286 MB (Python dicts) | 52 MB held, ~75 MB added to RSS¹ | same |
 | BM25F query | 13–17 ms | 1–2 ms | 1–2 ms |
 
 Notes:
@@ -215,7 +231,11 @@ The store returns `(row, raw score)` per signal, and the existing merging takes 
 - `type:`, which needs SciQLop's ParameterType (`data_serie_type`). It should become a column computed at ingest.
 - Qt's UTC-offset handling in date filters.
 
-Possible next steps: delta-packing the postings (77 MB → ~25 MB), and an ASCII fast path in the matcher.
+¹ Measured as RSS since the second round. The first version held 77 MB but added 151 MB: its build garbage stayed
+scattered. Terms are now 64-bit hashes and postings one exactly-sized flat array, built in bounded chunks, in 0.28 s on
+16 threads.
+
+Possible next steps: delta-packing the postings (52 MB → ~20 MB), and an ASCII fast path in the matcher.
 
 ## B. SciQLop's product tree
 
@@ -279,7 +299,9 @@ pysciqlop_cache and SciQLopPlots.
 - `tests/test_equivalence.py`: each store against speasy's trees.
 - `tests/test_search.py`, `tests/parity_sciqlopplots.json`, `tests/bm25_reference.py`: the search against SciQLopPlots and SciQLop.
 - `bench/search_bench.py`: search timings (`RAYON_NUM_THREADS=1` for one core).
-- `QT_INTEGRATION.md`, `src/capi.rs`, `include/inventory_store.h`, `qt/`, `tests/test_capi.py`: sharing the store with C++/Qt through a PyCapsule, and a Qt model over it.
+- `src/inventory.rs`, `tests/test_inventory.py`: the segmented inventory (lazy providers, lazy nodes, refreshes).
+- `QT_INTEGRATION.md`, `src/capi.rs`, `include/inventory_store.h`, `qt/`, `tests/test_capi.py`: sharing the inventory with C++/Qt through a PyCapsule, and a Qt model following its changes.
+- `bench/lazy_session.py`: a live speasy session with the Qt model attached; `bench/inventory_bench.py`: one store vs segments.
 - `bench/`: `bench.py` (one implementation per process), `clean_rss.py`, `run.py` (table).
 - Data, not committed:
   - `data/inventory_v2.json`: the proxy's version 2 `all` inventory plus the HAPI export;

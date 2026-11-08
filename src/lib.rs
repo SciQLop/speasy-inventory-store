@@ -1,6 +1,7 @@
 //! Python bindings. Row ids are plain ints; node 0 is the root.
 mod capi;
 mod interner;
+mod inventory;
 mod json;
 mod search;
 mod store;
@@ -328,7 +329,10 @@ impl PyStore {
     fn build_search(&self, py: Python, leaf_kinds: Vec<String>) -> usize {
         let kinds: Vec<&str> = leaf_kinds.iter().map(String::as_str).collect();
         let shared = &self.shared;
-        py.detach(|| shared.search.get_or_init(|| search::SearchIndex::build(&shared.store, &kinds)).leaves.len())
+        py.detach(|| {
+            shared.search.get_or_init(|| search::SearchIndex::build(&shared.store, &kinds, search::Place::default()))
+                .leaves.len()
+        })
     }
 
     fn search_heap_bytes(&self) -> usize {
@@ -337,8 +341,8 @@ impl PyStore {
 
     /// (path text, meta text) of every leaf, by row: SciQLop's corpus_snapshot.
     fn corpus(&self) -> PyResult<Vec<(u32, String, String)>> {
-        let inner = self.st();
-        Ok(self.index()?.leaves.iter().map(|&r| { let (p, m) = search::leaf_texts(inner, r); (r, p, m) }).collect())
+        let (inner, index) = (self.st(), self.index()?);
+        Ok(index.leaves.iter().map(|&r| { let (p, m) = search::leaf_texts(inner, r, &index.place); (r, p, m) }).collect())
     }
 
     /// The flat filter model's pass: query syntax, filters, fuzzy score. [(row, score)] for non-zero scores.
@@ -356,16 +360,111 @@ impl PyStore {
         Ok(hits.into_iter().map(|(i, s)| (index.leaves[i], s)).collect())
     }
 
-    /// The C function table over this store, in a PyCapsule named "speasy.inventory_store.v1" (include/inventory_store.h).
-    /// The capsule holds one reference; a C consumer that keeps the store calls retain() on it.
-    fn __inventory_store_c_api__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
-        PyCapsule::new_with_value(py, capi::Capsule(capi::api(&self.shared)), capi::CAPSULE_NAME)
-    }
-
-    /// Identifies this snapshot: two stores never share it.
+    /// Identifies this store: two stores never share it.
     #[getter]
     fn generation(&self) -> u64 {
         self.shared.generation
+    }
+
+    /// This store's segment number once mounted in an Inventory: node ids are (segment << 32 | row).
+    #[getter]
+    fn segment(&self) -> u32 {
+        inventory::segment_of(&self.shared)
+    }
+}
+
+/// The whole inventory, made of segments (NativeStores) mounted as speasy loads them: attached under the root by
+/// key (a provider's tree), or filling a childless node (a lazy node loading). Node ids are (segment << 32 | row);
+/// the root is 0. Mounting shares the store: it can't change afterwards.
+#[pyclass(name = "Inventory", module = "inventory_store", frozen)]
+struct PyInventory {
+    inner: Arc<inventory::Inventory>,
+}
+
+#[pymethods]
+impl PyInventory {
+    #[new]
+    fn new() -> Self {
+        PyInventory { inner: Arc::new(inventory::Inventory::default()) }
+    }
+
+    /// Attaches `store` under the root as `key`, replacing what was there. Returns its segment.
+    fn attach(&self, key: &str, store: PyRef<'_, PyStore>) -> u32 {
+        self.inner.attach(key, store.shared.clone())
+    }
+
+    fn detach(&self, key: &str) -> bool {
+        self.inner.detach(key)
+    }
+
+    /// Fills the childless node `host` with `store`'s root (its metadata and children). Returns its segment.
+    fn fill(&self, host: u64, store: PyRef<'_, PyStore>) -> PyResult<u32> {
+        use inventory::MountError::*;
+        self.inner.fill(host, store.shared.clone()).map_err(|e| {
+            PyValueError::new_err(match e {
+                NotAHost => format!("node {host:#x} is not in this inventory"),
+                NotChildless => format!("node {host:#x} has children: only a childless (lazy) node can be filled"),
+                AlreadyFilled => format!("node {host:#x} is already filled"),
+                NotFinished => "the store is empty: build it and call finish() first".to_owned(),
+            })
+        })
+    }
+
+    #[getter]
+    fn seq(&self) -> u64 {
+        self.inner.snapshot().seq
+    }
+
+    fn top(&self) -> Vec<(String, u32)> {
+        self.inner.snapshot().top()
+    }
+
+    fn children(&self, node: u64) -> Vec<u64> {
+        let snap = self.inner.snapshot();
+        (0..snap.child_count(node)).filter_map(|i| snap.child(node, i)).collect()
+    }
+
+    fn parent(&self, node: u64) -> Option<u64> {
+        self.inner.snapshot().parent(node)
+    }
+
+    fn row_in_parent(&self, node: u64) -> Option<u32> {
+        self.inner.snapshot().row_in_parent(node)
+    }
+
+    fn find_child(&self, node: u64, key: &str) -> Option<u64> {
+        self.inner.snapshot().find_child(node, key)
+    }
+
+    fn key(&self, node: u64) -> String {
+        self.inner.snapshot().key(node).to_owned()
+    }
+
+    fn display(&self, node: u64) -> String {
+        self.inner.snapshot().display(node)
+    }
+
+    /// (segment, row) holding `node`'s content: a filled node's content is its filling segment's root.
+    fn resolve(&self, node: u64) -> Option<(u32, u32)> {
+        self.inner.snapshot().resolve(node).map(|(m, row)| (m.seg, row))
+    }
+
+    /// SciQLop's flat filter pass over every segment: [(node, fuzzy score)].
+    fn search(&self, py: Python, query: &str) -> Vec<(u64, i32)> {
+        let snap = self.inner.snapshot();
+        py.detach(|| snap.search(query))
+    }
+
+    /// SciQLop's BM25F over every segment, with corpus-wide statistics: [(node, raw score)].
+    fn bm25(&self, py: Python, text: &str) -> Vec<(u64, f64)> {
+        let snap = self.inner.snapshot();
+        py.detach(|| snap.bm25(text))
+    }
+
+    /// The C function table over this inventory, in a PyCapsule named "speasy.inventory_store.v2"
+    /// (include/inventory_store.h). The capsule holds one reference; a C consumer that keeps it calls retain().
+    fn __inventory_store_c_api__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
+        PyCapsule::new_with_value(py, capi::Capsule(capi::api(&self.inner)), capi::CAPSULE_NAME)
     }
 }
 
@@ -385,6 +484,7 @@ fn parse_query(text: &str) -> (Vec<String>, Vec<(String, String)>) {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStore>()?;
+    m.add_class::<PyInventory>()?;
     m.add_function(wrap_pyfunction!(subsequence_score, m)?)?;
     m.add_function(wrap_pyfunction!(parse_query, m)?)
 }

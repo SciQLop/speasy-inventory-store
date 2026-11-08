@@ -1,9 +1,15 @@
-// A Qt item model reading speasy's inventory store through its C interface: no node objects, every index carries
-// the store row id (QModelIndex::internalId). The store is immutable, so the model never locks or takes the GIL.
+// A Qt item model over speasy's inventory, through its C interface (include/inventory_store.h).
+// No node objects: every index carries the inventory node id (QModelIndex::internalId).
+// The model reads one immutable snapshot, so it never locks or takes the GIL. When the inventory grows (lazy
+// providers, lazy nodes) or changes (refresh), it replays each change on its own thread: begin signal, switch to the
+// snapshot after that change, end signal. Unchanged parts keep their indexes, expansion and selection.
 #pragma once
 #include "inventory_store.h"
 
 #include <QAbstractItemModel>
+#include <atomic>
+
+static_assert(sizeof(quintptr) >= sizeof(InvNode), "node ids need a 64-bit quintptr");
 
 class StoreModel : public QAbstractItemModel
 {
@@ -16,11 +22,9 @@ public:
         KindRole,
     };
 
-    explicit StoreModel(QObject* parent = nullptr);
+    //! Retains the inventory, takes its current snapshot and follows its changes.
+    explicit StoreModel(const InventoryApi& api, QObject* parent = nullptr);
     ~StoreModel() override;
-
-    //! Takes its own reference on the store (retain); a refreshed inventory is a new store: one model reset.
-    void set_store(const InventoryStoreApi& api);
 
     QModelIndex index(int row, int column, const QModelIndex& parent = QModelIndex()) const override;
     QModelIndex parent(const QModelIndex& index) const override;
@@ -30,17 +34,26 @@ public:
     QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override;
     Qt::ItemFlags flags(const QModelIndex& index) const override;
 
-    //! Index of a store row (e.g. a search hit), for selecting or expanding it in a view.
-    QModelIndex index_of(uint32_t row) const;
-    //! SciQLop's product search over the store: rows of the hits with their score.
-    QList<QPair<uint32_t, double>> search(const QString& query) const;
+    //! Index of a node (e.g. a search hit), for selecting or expanding it in a view.
+    QModelIndex index_of(InvNode node) const;
+    //! SciQLop's product search over the model's snapshot: nodes of the hits with their score.
+    QList<QPair<InvNode, double>> search(const QString& query) const;
+    //! Replays the inventory's changes since the last sync. Runs on the model's thread; queued by the notification.
+    void sync();
 
 private:
-    uint32_t row_of(const QModelIndex& index) const;
+    static void notified(void* self);
+    static void replay(void* self, const InvChange* change, InvSnapshot after);
+    void apply(const InvChange& change, InvSnapshot after);
+    void switch_to(InvSnapshot snapshot, uint64_t seq);
+    InvNode node_of(const QModelIndex& index) const;
     QString text(InvStr s) const;
-    QString display_name(uint32_t row) const;
-    QString tooltip(uint32_t row) const;
+    QString display_name(InvNode node) const;
+    QString tooltip(InvNode node) const;
 
-    InventoryStoreApi m_api {};
-    bool m_has_store = false;
+    InventoryApi m_api;
+    InvSnapshot m_snap = nullptr;
+    uint64_t m_seq = 0;
+    uint64_t m_token = 0;
+    std::atomic<bool> m_sync_queued { false };
 };

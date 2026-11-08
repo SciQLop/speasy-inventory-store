@@ -1,22 +1,26 @@
-//! The C interface: a table of functions over one shared, immutable store, handed to C/C++ in a PyCapsule.
+//! The C interface of the inventory (version 2): a table of functions handed to C/C++ in a PyCapsule.
 //!
-//! Lifetime: the table's `handle` is one reference on the store (an `Arc`). A consumer that keeps the store calls
-//! `retain(handle)` and later `release(handle)`; the capsule releases its own reference when Python frees it.
-//! The store is immutable once shared, so every function may run on any thread without the GIL.
-//! Strings are borrowed UTF-8 (pointer + length), valid while the consumer holds a reference.
+//! - The inventory handle (`H`) is one reference on the inventory (an `Arc`): `retain`/`release` it.
+//! - Reads go through a snapshot (`S`, also an `Arc`): immutable, so any thread may read it without the GIL.
+//!   `snapshot(H)` gives the current one, released with `snapshot_release`.
+//! - The inventory grows and changes (lazy providers, lazy nodes, refreshes): `subscribe` gets a call after each
+//!   change (from the changing thread: only post an event there), and `changes_since` replays the changes in order,
+//!   each with the snapshot it leads to, so a Qt model emits begin/end row signals around the right states.
+//! Strings are borrowed UTF-8 (pointer + length), valid while the snapshot they come from is held.
 //! See include/inventory_store.h.
+use crate::inventory::{Change, Inventory, NodeId, Notify, Snapshot, ROOT};
 use crate::json::value_json;
-use crate::search::{parse, SearchIndex};
+use crate::search::SearchIndex;
 use crate::store::{Store, Val, NONE, OTHER};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-pub const ABI_VERSION: u32 = 1;
-pub const CAPSULE_NAME: &std::ffi::CStr = c"speasy.inventory_store.v1";
-const LEAF_KINDS: [&str; 2] = ["ParameterIndex", "TemplatedParameterIndex"];
+pub const ABI_VERSION: u32 = 2;
+pub const CAPSULE_NAME: &std::ffi::CStr = c"speasy.inventory_store.v2";
+const NO_NODE: NodeId = u64::MAX;
 
-/// The store plus what is derived from it lazily; shared by the Python object and every C consumer.
+/// One segment: a store plus what is derived from it lazily; shared by its Python object and the inventory.
 pub struct Shared {
     pub store: Store,
     pub search: OnceLock<SearchIndex>,
@@ -27,10 +31,6 @@ impl Shared {
     pub fn new(store: Store) -> Shared {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Shared { store, search: OnceLock::new(), generation: NEXT.fetch_add(1, Ordering::Relaxed) }
-    }
-
-    pub fn search_index(&self) -> &SearchIndex {
-        self.search.get_or_init(|| SearchIndex::build(&self.store, &LEAF_KINDS))
     }
 }
 
@@ -64,7 +64,6 @@ pub const INV_TUPLE: u32 = 7;
 pub const INV_DICT: u32 = 8;
 pub const INV_OPAQUE: u32 = 9;
 
-/// A metadata value: scalars typed, composites only tagged (use meta_text for a rendering), opaque as its str().
 #[repr(C)]
 pub struct InvValue {
     pub kind: u32,
@@ -74,7 +73,8 @@ pub struct InvValue {
 }
 
 pub type TextSink = extern "C" fn(ctx: *mut c_void, text: InvStr);
-pub type HitSink = extern "C" fn(ctx: *mut c_void, row: u32, score: f64);
+pub type HitSink = extern "C" fn(ctx: *mut c_void, node: NodeId, score: f64);
+pub type ChangeSink = extern "C" fn(ctx: *mut c_void, change: *const Change, after: S);
 
 pub const FIELD_KEY: u32 = 0;
 pub const FIELD_NAME: u32 = 1;
@@ -83,34 +83,40 @@ pub const FIELD_PROVIDER: u32 = 3;
 pub const FIELD_UID: u32 = 4;
 
 type H = *const c_void;
+type S = *const c_void;
 
 #[repr(C)]
-pub struct InventoryStoreApi {
+pub struct InventoryApi {
     pub abi_version: u32,
     pub struct_size: u32,
     pub handle: H,
     pub retain: extern "C" fn(H),
     pub release: extern "C" fn(H),
-    pub generation: extern "C" fn(H) -> u64,
-    pub node_count: extern "C" fn(H) -> u32,
-    pub child_count: extern "C" fn(H, u32) -> u32,
-    pub child: extern "C" fn(H, u32, u32) -> u32,
-    pub parent: extern "C" fn(H, u32) -> u32,
-    pub row_in_parent: extern "C" fn(H, u32) -> u32,
-    pub find_child: extern "C" fn(H, u32, InvStr) -> u32,
-    pub field: extern "C" fn(H, u32, u32) -> InvStr,
-    pub meta_count: extern "C" fn(H, u32) -> u32,
-    pub meta_key: extern "C" fn(H, u32, u32) -> InvStr,
-    pub meta_value: extern "C" fn(H, u32, u32, *mut InvValue),
-    pub meta_find: extern "C" fn(H, u32, InvStr) -> u32,
-    pub meta_text: extern "C" fn(H, u32, u32, TextSink, *mut c_void),
-    pub search: extern "C" fn(H, InvStr, HitSink, *mut c_void) -> u32,
-    pub bm25: extern "C" fn(H, InvStr, HitSink, *mut c_void) -> u32,
+    pub snapshot: extern "C" fn(H) -> S,
+    pub snapshot_retain: extern "C" fn(S),
+    pub snapshot_release: extern "C" fn(S),
+    pub snapshot_seq: extern "C" fn(S) -> u64,
+    pub subscribe: extern "C" fn(H, Notify, *mut c_void) -> u64,
+    pub unsubscribe: extern "C" fn(H, u64),
+    pub changes_since: extern "C" fn(H, u64, ChangeSink, *mut c_void) -> u32,
+    pub child_count: extern "C" fn(S, NodeId) -> u32,
+    pub child: extern "C" fn(S, NodeId, u32) -> NodeId,
+    pub parent: extern "C" fn(S, NodeId) -> NodeId,
+    pub row_in_parent: extern "C" fn(S, NodeId) -> u32,
+    pub find_child: extern "C" fn(S, NodeId, InvStr) -> NodeId,
+    pub field: extern "C" fn(S, NodeId, u32) -> InvStr,
+    pub meta_count: extern "C" fn(S, NodeId) -> u32,
+    pub meta_key: extern "C" fn(S, NodeId, u32) -> InvStr,
+    pub meta_value: extern "C" fn(S, NodeId, u32, *mut InvValue),
+    pub meta_find: extern "C" fn(S, NodeId, InvStr) -> u32,
+    pub meta_text: extern "C" fn(S, NodeId, u32, TextSink, *mut c_void),
+    pub search: extern "C" fn(S, InvStr, HitSink, *mut c_void) -> u32,
+    pub bm25: extern "C" fn(S, InvStr, HitSink, *mut c_void) -> u32,
 }
 
-/// Owns the capsule's reference; dropped (released) when Python frees the capsule.
-pub struct Capsule(pub InventoryStoreApi);
-// The handle is an Arc<Shared>, which is Send + Sync.
+/// Owns the capsule's reference; released when Python frees the capsule.
+pub struct Capsule(pub InventoryApi);
+// The handle is an Arc<Inventory>, which is Send + Sync.
 unsafe impl Send for Capsule {}
 
 impl Drop for Capsule {
@@ -119,24 +125,28 @@ impl Drop for Capsule {
     }
 }
 
-fn shared<'a>(h: H) -> &'a Shared {
-    // the caller holds a reference (the capsule's or its own retain), so the Arc is alive
-    unsafe { &*(h as *const Shared) }
+fn inventory<'a>(h: H) -> &'a Inventory {
+    unsafe { &*(h as *const Inventory) }
 }
 
-fn valid(st: &Store, row: u32) -> bool {
-    (row as usize) < st.len()
+fn snap<'a>(s: S) -> &'a Snapshot {
+    unsafe { &*(s as *const Snapshot) }
 }
 
-pub fn api(shared: &Arc<Shared>) -> InventoryStoreApi {
-    InventoryStoreApi {
+pub fn api(inv: &Arc<Inventory>) -> InventoryApi {
+    InventoryApi {
         abi_version: ABI_VERSION,
-        struct_size: size_of::<InventoryStoreApi>() as u32,
-        handle: Arc::into_raw(shared.clone()) as H,
+        struct_size: size_of::<InventoryApi>() as u32,
+        handle: Arc::into_raw(inv.clone()) as H,
         retain,
         release,
-        generation,
-        node_count,
+        snapshot,
+        snapshot_retain,
+        snapshot_release,
+        snapshot_seq,
+        subscribe,
+        unsubscribe,
+        changes_since,
         child_count,
         child,
         parent,
@@ -154,63 +164,81 @@ pub fn api(shared: &Arc<Shared>) -> InventoryStoreApi {
 }
 
 extern "C" fn retain(h: H) {
-    unsafe { Arc::increment_strong_count(h as *const Shared) }
+    unsafe { Arc::increment_strong_count(h as *const Inventory) }
 }
 
 extern "C" fn release(h: H) {
-    unsafe { Arc::decrement_strong_count(h as *const Shared) }
+    unsafe { Arc::decrement_strong_count(h as *const Inventory) }
 }
 
-extern "C" fn generation(h: H) -> u64 {
-    shared(h).generation
+extern "C" fn snapshot(h: H) -> S {
+    Arc::into_raw(inventory(h).snapshot()) as S
 }
 
-extern "C" fn node_count(h: H) -> u32 {
-    shared(h).store.len() as u32
+extern "C" fn snapshot_retain(s: S) {
+    unsafe { Arc::increment_strong_count(s as *const Snapshot) }
 }
 
-extern "C" fn child_count(h: H, row: u32) -> u32 {
-    let st = &shared(h).store;
-    if valid(st, row) { st.children(row).len() as u32 } else { 0 }
+extern "C" fn snapshot_release(s: S) {
+    unsafe { Arc::decrement_strong_count(s as *const Snapshot) }
 }
 
-extern "C" fn child(h: H, row: u32, i: u32) -> u32 {
-    let st = &shared(h).store;
-    if !valid(st, row) {
-        return NONE;
-    }
-    st.children(row).get(i as usize).copied().unwrap_or(NONE)
+extern "C" fn snapshot_seq(s: S) -> u64 {
+    snap(s).seq
 }
 
-extern "C" fn parent(h: H, row: u32) -> u32 {
-    let st = &shared(h).store;
-    if valid(st, row) { st.parent(row).unwrap_or(NONE) } else { NONE }
+extern "C" fn subscribe(h: H, notify: Notify, ctx: *mut c_void) -> u64 {
+    inventory(h).subscribe(notify, ctx)
 }
 
-/// Position among its siblings (QModelIndex::row()); children are stored sorted by row id.
-extern "C" fn row_in_parent(h: H, row: u32) -> u32 {
-    let st = &shared(h).store;
-    match valid(st, row).then(|| st.parent(row)).flatten() {
-        Some(p) => st.children(p).binary_search(&row).map_or(NONE, |i| i as u32),
-        None => 0,
-    }
+extern "C" fn unsubscribe(h: H, token: u64) {
+    inventory(h).unsubscribe(token)
 }
 
-extern "C" fn find_child(h: H, row: u32, key: InvStr) -> u32 {
-    let st = &shared(h).store;
-    match (valid(st, row), unsafe { key.as_str() }) {
-        (true, Some(k)) => st.find_child(row, k).unwrap_or(NONE),
-        _ => NONE,
+/// Replays the changes after `after_seq` in order; the snapshot passed with each is borrowed for the call (retain it
+/// to keep it). Returns how many were replayed, or 0xFFFFFFFF when the log no longer reaches `after_seq`: reset.
+extern "C" fn changes_since(h: H, after_seq: u64, sink: ChangeSink, ctx: *mut c_void) -> u32 {
+    match inventory(h).changes_since(after_seq) {
+        Ok(changes) => {
+            for (change, after) in &changes {
+                sink(ctx, change, Arc::as_ptr(after) as S);
+            }
+            changes.len() as u32
+        }
+        Err(()) => NONE,
     }
 }
 
-extern "C" fn field(h: H, row: u32, which: u32) -> InvStr {
-    let st = &shared(h).store;
-    if !valid(st, row) {
-        return InvStr::EMPTY;
+extern "C" fn child_count(s: S, id: NodeId) -> u32 {
+    snap(s).child_count(id)
+}
+
+extern "C" fn child(s: S, id: NodeId, i: u32) -> NodeId {
+    snap(s).child(id, i).unwrap_or(NO_NODE)
+}
+
+extern "C" fn parent(s: S, id: NodeId) -> NodeId {
+    snap(s).parent(id).unwrap_or(NO_NODE)
+}
+
+extern "C" fn row_in_parent(s: S, id: NodeId) -> u32 {
+    snap(s).row_in_parent(id).unwrap_or(if id == ROOT { 0 } else { NONE })
+}
+
+extern "C" fn find_child(s: S, id: NodeId, key: InvStr) -> NodeId {
+    match unsafe { key.as_str() } {
+        Some(k) => snap(s).find_child(id, k).unwrap_or(NO_NODE),
+        None => NO_NODE,
     }
+}
+
+extern "C" fn field(s: S, id: NodeId, which: u32) -> InvStr {
+    let sn = snap(s);
+    if which == FIELD_KEY {
+        return InvStr::of(sn.key(id));
+    }
+    let Some((st, row)) = sn.at(id) else { return InvStr::EMPTY };
     match which {
-        FIELD_KEY => InvStr::of(st.key(row)),
         FIELD_NAME => InvStr::of(st.name(row)),
         FIELD_KIND => InvStr::of(st.kind(row)),
         FIELD_PROVIDER => InvStr::of(st.provider(row)),
@@ -219,18 +247,17 @@ extern "C" fn field(h: H, row: u32, which: u32) -> InvStr {
     }
 }
 
-extern "C" fn meta_count(h: H, row: u32) -> u32 {
-    let st = &shared(h).store;
-    if valid(st, row) { st.raw_meta(row).count() as u32 } else { 0 }
+extern "C" fn meta_count(s: S, id: NodeId) -> u32 {
+    snap(s).at(id).map_or(0, |(st, row)| st.raw_meta(row).count() as u32)
 }
 
-fn entry(st: &Store, row: u32, i: u32) -> Option<(u32, u32)> {
-    valid(st, row).then(|| st.raw_meta(row).nth(i as usize)).flatten()
+fn entry(sn: &Snapshot, id: NodeId, i: u32) -> Option<(&Store, u32, u32)> {
+    let (st, row) = sn.at(id)?;
+    st.raw_meta(row).nth(i as usize).map(|(k, v)| (st, k, v))
 }
 
-extern "C" fn meta_key(h: H, row: u32, i: u32) -> InvStr {
-    let st = &shared(h).store;
-    entry(st, row, i).map_or(InvStr::EMPTY, |(k, _)| InvStr::of(st.s.str(k)))
+extern "C" fn meta_key(s: S, id: NodeId, i: u32) -> InvStr {
+    entry(snap(s), id, i).map_or(InvStr::EMPTY, |(st, k, _)| InvStr::of(st.s.str(k)))
 }
 
 fn to_value(st: &Store, v: u32) -> InvValue {
@@ -254,29 +281,26 @@ fn to_value(st: &Store, v: u32) -> InvValue {
     out
 }
 
-extern "C" fn meta_value(h: H, row: u32, i: u32, out: *mut InvValue) {
-    let st = &shared(h).store;
+extern "C" fn meta_value(s: S, id: NodeId, i: u32, out: *mut InvValue) {
     if out.is_null() {
         return;
     }
-    let value = entry(st, row, i).map_or(
+    let value = entry(snap(s), id, i).map_or(
         InvValue { kind: INV_NULL, int_value: 0, float_value: 0.0, text: InvStr::EMPTY },
-        |(_, v)| to_value(st, v),
+        |(st, _, v)| to_value(st, v),
     );
     unsafe { out.write(value) }
 }
 
-/// Index of the metadata entry named `key`, or NONE.
-extern "C" fn meta_find(h: H, row: u32, key: InvStr) -> u32 {
-    let st = &shared(h).store;
-    let (Some(k), true) = (unsafe { key.as_str() }.and_then(|k| st.s.get(k)), valid(st, row)) else { return NONE };
+extern "C" fn meta_find(s: S, id: NodeId, key: InvStr) -> u32 {
+    let Some((st, row)) = snap(s).at(id) else { return NONE };
+    let Some(k) = (unsafe { key.as_str() }).and_then(|k| st.s.get(k)) else { return NONE };
     st.raw_meta(row).position(|(kk, _)| kk == k).map_or(NONE, |i| i as u32)
 }
 
 /// Any value as text: strings as is, scalars printed, composites as JSON. The text lives during the call only.
-extern "C" fn meta_text(h: H, row: u32, i: u32, sink: TextSink, ctx: *mut c_void) {
-    let st = &shared(h).store;
-    let Some((_, v)) = entry(st, row, i) else { return };
+extern "C" fn meta_text(s: S, id: NodeId, i: u32, sink: TextSink, ctx: *mut c_void) {
+    let Some((st, _, v)) = entry(snap(s), id, i) else { return };
     let text = if v & OTHER == 0 {
         st.s.str(v).to_owned()
     } else {
@@ -289,26 +313,20 @@ extern "C" fn meta_text(h: H, row: u32, i: u32, sink: TextSink, ctx: *mut c_void
     sink(ctx, InvStr::of(&text));
 }
 
-/// SciQLop's flat filter pass (query syntax, filters, fuzzy score); one sink call per hit. Returns the hit count.
-extern "C" fn search(h: H, query: InvStr, sink: HitSink, ctx: *mut c_void) -> u32 {
-    let sh = shared(h);
+extern "C" fn search(s: S, query: InvStr, sink: HitSink, ctx: *mut c_void) -> u32 {
     let Some(q) = (unsafe { query.as_str() }) else { return 0 };
-    let index = sh.search_index();
-    let hits = index.fuzzy(&sh.store, &parse(q));
-    for &(i, s) in &hits {
-        sink(ctx, index.leaves[i], s as f64);
+    let hits = snap(s).search(q);
+    for &(id, score) in &hits {
+        sink(ctx, id, score as f64);
     }
     hits.len() as u32
 }
 
-/// SciQLop's BM25F signal; one sink call per leaf matching a term. Returns the hit count.
-extern "C" fn bm25(h: H, text: InvStr, sink: HitSink, ctx: *mut c_void) -> u32 {
-    let sh = shared(h);
+extern "C" fn bm25(s: S, text: InvStr, sink: HitSink, ctx: *mut c_void) -> u32 {
     let Some(t) = (unsafe { text.as_str() }) else { return 0 };
-    let index = sh.search_index();
-    let hits = index.bm25(t);
-    for &(i, s) in &hits {
-        sink(ctx, index.leaves[i], s);
+    let hits = snap(s).bm25(t);
+    for &(id, score) in &hits {
+        sink(ctx, id, score);
     }
     hits.len() as u32
 }
