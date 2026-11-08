@@ -175,6 +175,11 @@ impl Store {
         self.meta_range(i).find(|&m| self.meta_key[m] == k).map(|m| self.value(self.meta_val[m]))
     }
 
+    pub fn find_child(&self, i: u32, key: &str) -> Option<u32> {
+        let k = self.s.get(key)?;
+        self.children(i).iter().copied().find(|&c| self.key[c as usize] == k)
+    }
+
     pub fn find_uid(&self, provider: &str, uid: &str) -> Option<u32> {
         self.by_uid.get(&(self.s.get(provider)?, self.s.get(uid)?)).copied()
     }

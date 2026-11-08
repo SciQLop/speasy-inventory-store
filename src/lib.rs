@@ -267,6 +267,21 @@ impl PyStore {
         self.inner.find_uid(provider, uid)
     }
 
+    /// One attribute of a node, for the views: (True, child row) or (False, metadata value); None if absent.
+    fn lookup<'py>(&self, py: Python<'py>, i: u32, key: &str) -> PyResult<Option<(bool, Bound<'py, PyAny>)>> {
+        let i = self.check(i)?;
+        if let Some(c) = self.inner.find_child(i, key) {
+            return Ok(Some((true, c.into_pyobject(py)?.into_any())));
+        }
+        let mut out = Out::new(py, &self.inner, &self.opaque, false);
+        self.inner.get(i, key).map(|m| Ok((false, out.meta(m)?))).transpose()
+    }
+
+    /// Children keys of a node, in order.
+    fn child_keys(&self, i: u32) -> PyResult<Vec<&str>> {
+        Ok(self.inner.children(self.check(i)?).iter().map(|&c| self.inner.key(c)).collect())
+    }
+
     fn find_path(&self, path: &str) -> Option<u32> {
         self.inner.find_path(path)
     }
@@ -282,10 +297,12 @@ impl PyStore {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
-    /// Rebuilds a tree of the old index classes ({type name: class}), for the legacy pickle.
-    fn to_legacy<'py>(&self, py: Python<'py>, types: &Bound<'py, PyDict>, default: &Bound<'py, PyAny>)
+    /// Rebuilds a tree of the old index classes ({type name: class}) from `row` down, for the legacy pickle.
+    #[pyo3(signature = (types, default, row=0))]
+    fn to_legacy<'py>(&self, py: Python<'py>, types: &Bound<'py, PyDict>, default: &Bound<'py, PyAny>, row: u32)
         -> PyResult<Bound<'py, PyAny>> {
-        Out::new(py, &self.inner, &self.opaque, true).legacy(0, types, default)
+        let row = self.check(row)?;
+        Out::new(py, &self.inner, &self.opaque, true).legacy(row, types, default)
     }
 
     fn heap_bytes(&self) -> usize {
