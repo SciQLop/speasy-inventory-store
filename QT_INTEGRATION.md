@@ -15,16 +15,49 @@ Status: research and prototype, 2026-11-08. Code: `src/inventory.rs`, `src/capi.
    - Every change is logged with the snapshot it leads to.
    - The Qt model replays each one with the right begin/end row signals, so untouched parts keep their indexes,
      expansion and selection.
-3. **Checked in a live speasy session** (`bench/lazy_session.py`) with `QAbstractItemModelTester` watching every signal:
+3. **The payoff is in SciQLop:** its main process holds about 1.9 GB today for the inventory, the product tree copy, the
+   filter models and the BM25 index. The store would hold about 140 MB (section 0).
+4. **Checked in a live speasy session** (`bench/lazy_session.py`) with `QAbstractItemModelTester` watching every signal:
    - CDA, AMDA and HAPI start on first use;
    - 3 HAPI servers and 3 datasets load lazily;
    - CDA is refreshed;
    - no tester failure throughout, pinned indexes outside the changed parts stay valid, and search finds the new
      products.
-4. **The performance holds:** the segmented inventory searches exactly like one store (same scores, same speed). The Qt
+5. **The performance holds:** the segmented inventory searches exactly like one store (same scores, same speed). The Qt
    walk covers all 115,574 nodes in 19 ms.
 
-## 1. One inventory made of segments
+## 0. What SciQLop costs today (`bench/sciqlop_today.py`)
+
+This replays SciQLop's startup path with Qt offscreen, using SciQLop's own environment: speasy 1.8.5, which has no HAPI
+provider, and PySide6/Qt 6.11.
+- the speasy plugin's `init_providers()`, then `build_product_tree` and `ProductsModel.add_node`;
+- a search through the product view's flat and tree filter models;
+- the smart search's corpus snapshot and BM25F build.
+
+It runs in one process, and RSS growth is measured per step. 77,001 leaves.
+
+| step | time | RSS | today, where it lives | with the inventory store |
+|---|---|---|---|---|
+| speasy inventories (import + init) | 3.3 s | +446 MB | main process | 66 MB store; tree views on top |
+| product tree copy (77k QObjects + QVariantMap + tooltip + search text) | 3.3 s | +928 MB | main process | no copy: the model reads the store (walk of 115k nodes in 19 ms) |
+| flat filter model, one query until settled | 1.1 s | +148 MB | per filter model (SciQLop has 5) | the store's search: 140 ms, results only |
+| tree filter model, same query | 0.6 s | +72 MB | product view | the store's search plus the hits' ancestors |
+| smart search corpus snapshot | 0.6 s | +156 MB | main process, at every reindex | not needed: the index reads the store |
+| BM25F build | 4.0 s | +866 MB peak | subprocess, at every model change | 0.28 s, about 75 MB, in-process, once per segment |
+| BM25F index kept (after the pickle transfer: 43 MB pickle, 1.3 s) | — | +345 MB | main process | included above |
+| BM25F query | 24 ms | — | | 1.5–2.6 ms |
+| embeddings, if enabled | — | 75 / 150 MB | main process | unchanged (stays in SciQLop) |
+
+**Main process in steady state: about 1.9 GB** (speasy 446 + tree copy 928 + two filter models 220 + BM25 345),
+before embeddings. With the store it's about 140 MB for the same functions. Startup also drops from about 6.6 s
+(speasy + tree copy) to speasy's own load, and the 4 s BM25 rebuild disappears.
+
+**Caveats:**
+- These are RSS deltas within one process: a step may reuse memory an earlier one freed, so they're approximations.
+- speasy 1.9 loads providers lazily and adds HAPI. In the views session above, its inventories took 257 MB.
+- The two memory figures don't count exactly the same things: the store side leaves out the Python views of a running speasy.
+
+
 
 speasy's inventory never exists all at once. From the code:
 - **Providers start on first access.** `speasy/inventories/__init__.py` routes `tree.<provider>` and
