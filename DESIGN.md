@@ -132,30 +132,56 @@ Open design point: **lazily loaded subtrees.**
 
 Not prototyped yet: the views of steps 2–3, and running speasy's test suite and SciQLop's speasy plugin against them.
 
-## A. Queries and search
+## A. SciQLop's search, in the store (src/search.rs)
 
-Today SciQLop's smart search doesn't read speasy at all:
-- It snapshots the ProductsModel leaves into one text blob each (path + every metadata `k: v`).
-- It rebuilds a hand-rolled BM25F index (path weight 6, meta 1) in a subprocess on every model change, which takes about 2 s for 77k leaves.
-- An optional model2vec embedding fallback runs on top of it.
-- Field filters (`provider:`, `type:`, `after:`/`before:`, any `key:value`) are linear C++ scans in the filter models.
+The store now runs SciQLop's product search over its leaves (85,637 parameters):
+- **Query syntax:** a port of SciQLopPlots' `QueryParser`. Free-text tokens, `field:value`, quoted tokens, partial
+  dates for `after:`/`before:`.
+- **Filters:** a port of `ProductsFlatFilterModel::filters_match`:
+  - `after:`/`before:` against `stop_date`/`start_date`;
+  - `provider:`;
+  - any other key as a case-insensitive exact match on the metadata value.
+- **Fuzzy signal:** a port of `SubsequenceMatcher` and `free_text_score`. Every token must match the path or meta text,
+  and the scores add up. It runs in parallel with rayon.
+- **BM25F signal:** SciQLop's `bm25_index.py` (same tokenizer, k1, b and field weights), as an inverted index built in parallel.
+- **Leaf texts:** they follow the speasy plugin (display names for the path; name + sorted scalar metadata + uid, provider,
+  speasy_id, stable_id and instrument_description for meta). They aren't kept, which would cost 149 MB; each search regenerates them,
+  at about 5 µs per leaf.
 
-**Can move to the store:**
-- **Predicate filters:** provider, kind, parameter type, time coverage overlap, mission or instrument as an ancestor test, and
-  units once promoted to a column. A native scan answers in 2 ms where walking the tree takes 100 ms. With columns, these become bitmaps.
-- **Full-text BM25:** tantivy with two fields (path, meta) and the same boosts. It replaces the Python inverted lists and the
-  per-change rebuild, and can be updated incrementally.
-- **Distinct values** for autocompletion.
+Parity (`tests/test_search.py`):
+- 24,000 fuzzy scores on real leaf texts are equal to SciQLopPlots' (fixture generated with its Python binding);
+- query parsing is equal on tricky inputs;
+- BM25F scores are equal to SciQLop's Python on 5 queries (rel. 1e-9);
+- the C++ finds exactly the same hits over the whole corpus.
 
-**Must stay in SciQLop:**
-- embeddings (model choice, download, the cache keyed by text, cosine similarity);
-- how the search text is composed;
-- score fusion (the 100/50 bands, Override merge);
-- fuzzy subsequence scoring;
-- non-speasy rows (virtual products, scenes, plugin nodes). These need either an ingest API for foreign rows, or SciQLop keeps
-  searching the union.
+| on 85,637 leaves | SciQLop today | store, 1 core | store, 16 threads |
+|---|---|---|---|
+| fuzzy, `mag` | 0.60 s (C++ via binding, 1 core) | 0.56 s | 0.07 s |
+| fuzzy, `mms1 fgm bgse` | 1.88 s | 1.08 s | 0.14 s |
+| fuzzy, `magnetic field vector` | 2.80 s | 1.73 s | 0.23 s |
+| fuzzy, `provider:cda after:2020 b_gse` | — | 0.26 s | 0.04 s |
+| BM25F index build | 3.3 s (Python, in a subprocess, on every model change) | 1.6 s | 0.5 s |
+| BM25F index memory | 286 MB (Python dicts) | 77 MB | 77 MB |
+| BM25F query | 13–17 ms | 1–2 ms | 1–2 ms |
 
-The interface to keep stable is SciQLop's `path_key → score` dict. Not prototyped: tantivy.
+Notes:
+- The C++ times include converting Python strings to `QString` on each call. Inside SciQLopPlots, the texts are already
+  `QString`s, and the pass runs in parallel batches of 2000.
+- tantivy isn't needed: at this size a hand-written inverted index is small, fast, and gives SciQLop's exact scores.
+
+**Still in SciQLop:**
+- embeddings (model2vec: model, download, cache, cosine);
+- fusing the signals (`score_query` bands, `merge_scores` strategies);
+- the UI's progressive streaming;
+- non-speasy rows (virtual products, scenes, plugin nodes). These need an ingest path into the store, or a second small corpus on the SciQLop side.
+
+The store returns `(row, raw score)` per signal, and the existing merging takes it from there.
+
+**Not ported:**
+- `type:`, which needs SciQLop's ParameterType (`data_serie_type`). It should become a column computed at ingest.
+- Qt's UTC-offset handling in date filters.
+
+Possible next steps: delta-packing the postings (77 MB → ~25 MB), and an ASCII fast path in the matcher.
 
 ## B. SciQLop's product tree
 
@@ -194,13 +220,14 @@ never sees the implementation language.
 - the existing meson and wheel pipelines.
 
 **For Rust:**
-- tantivy for full-text search; C++ has no equivalent as easy to use (Xapian is GPL, Lucene++ is stale);
-- serde, hashbrown and maturin abi3 wheels with little effort;
-- the cocat rewrite went well;
-- the core is about 600 lines either way.
+- serde, hashbrown, rayon and maturin abi3 wheels with little effort;
+- the cocat rewrite went well.
 
-**Recommendation:** Rust if search moves into the store (question A), which is where the biggest user-visible win is.
-C++ if the store stays a plain container.
+The search turned out to need no library: tantivy isn't needed, so it no longer argues for Rust. The core is about 1,000 lines
+either way, and C++ has `cpp_utils::threading` for the parallel pass.
+
+**Recommendation:** it comes down to toolchains. Rust keeps this prototype as is. C++ keeps one native toolchain with CDFpp,
+pysciqlop_cache and SciQLopPlots.
 
 ## Cost not paid yet: wheels
 
@@ -216,6 +243,8 @@ C++ if the store stays a plain container.
 - `src/`: Rust store (`interner.rs`, `store.rs`, `json.rs`, Python bindings in `lib.rs`).
 - `python/inventory_store/`: the two pure-Python stores (`columnar.py`, `blob.py`).
 - `tests/test_equivalence.py`: each store against speasy's trees.
+- `tests/test_search.py`, `tests/parity_sciqlopplots.json`, `tests/bm25_reference.py`: the search against SciQLopPlots and SciQLop.
+- `bench/search_bench.py`: search timings (`RAYON_NUM_THREADS=1` for one core).
 - `bench/`: `bench.py` (one implementation per process), `clean_rss.py`, `run.py` (table).
 - Data, not committed:
   - `data/inventory_v2.json`: the proxy's version 2 `all` inventory plus the HAPI export;

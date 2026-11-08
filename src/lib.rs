@@ -1,6 +1,7 @@
 //! Python bindings. Row ids are plain ints; node 0 is the root.
 mod interner;
 mod json;
+mod search;
 mod store;
 
 use json::{NodeRef, SPZ_KEYS};
@@ -165,11 +166,16 @@ impl<'py, 'a> Out<'py, 'a> {
 struct PyStore {
     inner: Store,
     opaque: Vec<Py<PyAny>>,
+    search: Option<search::SearchIndex>,
 }
 
 impl PyStore {
     fn check(&self, i: u32) -> PyResult<u32> {
         if (i as usize) < self.inner.len() { Ok(i) } else { Err(PyIndexError::new_err(i)) }
+    }
+
+    fn index(&self) -> PyResult<&search::SearchIndex> {
+        self.search.as_ref().ok_or_else(|| PyValueError::new_err("call build_search() first"))
     }
 
     fn ingest(&mut self) -> Ingest<'_> {
@@ -181,13 +187,13 @@ impl PyStore {
 impl PyStore {
     #[new]
     fn new() -> Self {
-        PyStore { inner: Store::default(), opaque: Vec::new() }
+        PyStore { inner: Store::default(), opaque: Vec::new(), search: None }
     }
 
     #[staticmethod]
     fn from_json(text: &str) -> PyResult<Self> {
         json::from_json(text)
-            .map(|inner| PyStore { inner, opaque: Vec::new() })
+            .map(|inner| PyStore { inner, opaque: Vec::new(), search: None })
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
@@ -285,9 +291,60 @@ impl PyStore {
     fn heap_bytes(&self) -> usize {
         self.inner.heap_bytes()
     }
+
+    /// Builds SciQLop's search corpus (one path and one meta text per leaf) and its BM25F index.
+    #[pyo3(signature = (leaf_kinds=vec!["ParameterIndex".to_owned(), "TemplatedParameterIndex".to_owned()]))]
+    fn build_search(&mut self, py: Python, leaf_kinds: Vec<String>) -> usize {
+        let kinds: Vec<&str> = leaf_kinds.iter().map(String::as_str).collect();
+        let inner = &self.inner;
+        let index = py.detach(|| search::SearchIndex::build(inner, &kinds));
+        let n = index.leaves.len();
+        self.search = Some(index);
+        n
+    }
+
+    fn search_heap_bytes(&self) -> usize {
+        self.search.as_ref().map_or(0, search::SearchIndex::heap_bytes)
+    }
+
+    /// (path text, meta text) of every leaf, by row: SciQLop's corpus_snapshot.
+    fn corpus(&self) -> PyResult<Vec<(u32, String, String)>> {
+        let inner = &self.inner;
+        Ok(self.index()?.leaves.iter().map(|&r| { let (p, m) = search::leaf_texts(inner, r); (r, p, m) }).collect())
+    }
+
+    /// The flat filter model's pass: query syntax, filters, fuzzy score. [(row, score)] for non-zero scores.
+    fn search(&self, py: Python, query: &str) -> PyResult<Vec<(u32, i32)>> {
+        let (index, inner) = (self.index()?, &self.inner);
+        let q = search::parse(query);
+        let hits = py.detach(|| index.fuzzy(inner, &q));
+        Ok(hits.into_iter().map(|(i, s)| (index.leaves[i], s)).collect())
+    }
+
+    /// SciQLop's BM25F signal: [(row, raw score)] for leaves matching at least one term.
+    fn bm25(&self, py: Python, text: &str) -> PyResult<Vec<(u32, f64)>> {
+        let index = self.index()?;
+        let hits = py.detach(|| index.bm25(text));
+        Ok(hits.into_iter().map(|(i, s)| (index.leaves[i], s)).collect())
+    }
+}
+
+#[pyfunction]
+fn subsequence_score(query: &str, candidate: &str) -> i32 {
+    let q: Vec<char> = query.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
+    search::subsequence_score(&q, candidate)
+}
+
+/// (free text tokens, [(field, value)]), as SciQLopPlots' QueryParser gives them.
+#[pyfunction]
+fn parse_query(text: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let q = search::parse(text);
+    (q.free_text, q.filters.into_iter().map(|f| (f.field, f.value)).collect())
 }
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyStore>()
+    m.add_class::<PyStore>()?;
+    m.add_function(wrap_pyfunction!(subsequence_score, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_query, m)?)
 }
