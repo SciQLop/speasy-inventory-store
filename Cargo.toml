@@ -1,0 +1,19 @@
+[package]
+name = "inventory_store"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "inventory_store"
+crate-type = ["cdylib"]
+
+[dependencies]
+hashbrown = "0.17"
+pyo3 = { version = "0.30", features = ["abi3-py310", "extension-module"] }
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

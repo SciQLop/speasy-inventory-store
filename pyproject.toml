@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[project]
+name = "inventory-store"
+version = "0.1.0"
+description = "Prototype: a columnar store for speasy's inventory, benchmarked against the Python tree"
+requires-python = ">=3.10"
+
+[tool.maturin]
+python-source = "python"
+module-name = "inventory_store._native"
